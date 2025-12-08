@@ -5,6 +5,10 @@
 
 起動方法:
     streamlit run app.py
+
+ページ構成:
+    - app.py: メイン（予測実行）
+    - pages/01_accuracy.py: 予測精度検証
 """
 
 import streamlit as st
