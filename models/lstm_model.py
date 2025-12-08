@@ -17,10 +17,10 @@ def get_device():
     """利用可能なデバイスを取得"""
     if torch.cuda.is_available():
         device = torch.device("cuda")
-        print(f"🚀 GPU使用: {torch.cuda.get_device_name(0)}")
+        print(f"[GPU] {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
-        print("💻 CPU使用")
+        print("[CPU] Mode")
     return device
 
 
@@ -211,7 +211,7 @@ class StockLSTMPredictor:
                 'hidden_size': self.hidden_size,
                 'num_layers': self.num_layers
             }, path)
-            print(f"✅ モデルを保存しました: {path}")
+            print(f"[OK] Model saved: {path}")
     
     def load_model(self, path: str):
         """モデルを読み込み"""
@@ -230,7 +230,7 @@ class StockLSTMPredictor:
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.is_trained = True
-        print(f"✅ モデルを読み込みました: {path}")
+        print(f"[OK] Model loaded: {path}")
 
 
 def check_gpu_availability():
@@ -240,7 +240,7 @@ def check_gpu_availability():
     print("=" * 50)
     
     if torch.cuda.is_available():
-        print(f"✅ CUDA Available: True")
+        print(f"[OK] CUDA Available: True")
         print(f"   Device Name: {torch.cuda.get_device_name(0)}")
         print(f"   CUDA Version: {torch.version.cuda}")
         print(f"   Device Count: {torch.cuda.device_count()}")
@@ -249,7 +249,7 @@ def check_gpu_availability():
         total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"   Total Memory: {total_memory:.2f} GB")
     else:
-        print("❌ CUDA Available: False")
+        print("[--] CUDA Available: False")
         print("   Using CPU instead")
     
     print("=" * 50)
