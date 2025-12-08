@@ -5,10 +5,6 @@
 
 起動方法:
     streamlit run app.py
-
-ページ構成:
-    - app.py: メイン（予測実行）
-    - pages/01_accuracy.py: 予測精度検証
 """
 
 import streamlit as st
@@ -31,6 +27,14 @@ from statsmodels.tsa.arima.model import ARIMA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+
+# LSTM (PyTorch) インポート
+try:
+    import torch
+    from models.lstm_model import StockLSTMPredictor, check_gpu_availability, get_device
+    PYTORCH_AVAILABLE = True
+except ImportError:
+    PYTORCH_AVAILABLE = False
 
 # ページ設定
 st.set_page_config(
@@ -231,7 +235,7 @@ def get_signals(data: pd.DataFrame) -> list:
     return signals
 
 
-def create_chart(data: pd.DataFrame, arima_pred=None, arima_ci=None, ml_pred=None, forecast_days=30):
+def create_chart(data: pd.DataFrame, arima_pred=None, arima_ci=None, ml_pred=None, lstm_pred=None, forecast_days=30):
     """Plotlyチャートを作成"""
     fig = make_subplots(
         rows=4, cols=1,
@@ -281,6 +285,12 @@ def create_chart(data: pd.DataFrame, arima_pred=None, arima_ci=None, ml_pred=Non
                                        periods=forecast_days, freq='B')
         fig.add_trace(go.Scatter(x=forecast_dates, y=ml_pred, name='ML予測',
                                 line=dict(color='green', dash='dash')), row=1, col=1)
+    
+    if lstm_pred is not None:
+        forecast_dates = pd.date_range(start=data.index[-1] + timedelta(days=1),
+                                       periods=forecast_days, freq='B')
+        fig.add_trace(go.Scatter(x=forecast_dates, y=lstm_pred, name='🚀 LSTM予測',
+                                line=dict(color='purple', dash='dash', width=2)), row=1, col=1)
     
     # RSI
     fig.add_trace(go.Scatter(x=data.index, y=data['RSI'], name='RSI',
@@ -339,6 +349,20 @@ forecast_days = st.sidebar.slider(
 run_arima = st.sidebar.checkbox("ARIMA予測", value=True)
 run_ml = st.sidebar.checkbox("機械学習予測", value=True)
 
+# LSTM (GPU対応) オプション
+if PYTORCH_AVAILABLE:
+    run_lstm = st.sidebar.checkbox("🚀 LSTM予測 (GPU対応)", value=False)
+    if run_lstm:
+        device = get_device()
+        if torch.cuda.is_available():
+            st.sidebar.success(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            st.sidebar.info("💻 CPU モードで実行")
+        lstm_epochs = st.sidebar.slider("LSTMエポック数", 50, 200, 100)
+else:
+    run_lstm = False
+    st.sidebar.warning("⚠️ PyTorchがインストールされていません。LSTM予測は無効です。")
+
 # 分析実行ボタン
 if st.sidebar.button("🔍 分析実行", type="primary"):
     with st.spinner("データを取得中..."):
@@ -357,7 +381,7 @@ if st.sidebar.button("🔍 分析実行", type="primary"):
     col4.metric("出来高", f"{latest['Volume']:,.0f}")
     
     # 予測実行
-    arima_pred, arima_ci, ml_pred = None, None, None
+    arima_pred, arima_ci, ml_pred, lstm_pred = None, None, None, None
     
     if run_arima:
         with st.spinner("ARIMA予測中..."):
@@ -368,6 +392,17 @@ if st.sidebar.button("🔍 分析実行", type="primary"):
         with st.spinner("機械学習予測中..."):
             ml_pred, score = predict_ml(data, forecast_days)
             st.success(f"✅ 機械学習予測完了 (R²={score:.4f})")
+    
+    if run_lstm and PYTORCH_AVAILABLE:
+        with st.spinner("🚀 LSTM予測中 (GPU使用)..."):
+            try:
+                predictor = StockLSTMPredictor(sequence_length=30, hidden_size=64)
+                predictor.train(data['Close'].values, epochs=lstm_epochs, verbose=False)
+                lstm_pred = predictor.predict(data['Close'].values, forecast_days=forecast_days)
+                device_name = "GPU" if torch.cuda.is_available() else "CPU"
+                st.success(f"✅ LSTM予測完了 ({device_name}使用)")
+            except Exception as e:
+                st.error(f"❌ LSTM予測エラー: {e}")
     
     # シグナル表示
     st.subheader("📊 売買シグナル")
@@ -411,9 +446,9 @@ if st.sidebar.button("🔍 分析実行", type="primary"):
         st.warning(f"➡️ **中立** (買い{buy_count} / 売り{sell_count})")
     
     # 予測結果
-    if arima_pred is not None or ml_pred is not None:
+    if arima_pred is not None or ml_pred is not None or lstm_pred is not None:
         st.subheader("🔮 予測結果")
-        pred_cols = st.columns(2)
+        pred_cols = st.columns(3)
         
         if arima_pred is not None:
             future_price = arima_pred.iloc[-1]
@@ -434,10 +469,20 @@ if st.sidebar.button("🔍 分析実行", type="primary"):
                     f"{future_price:.2f}",
                     f"{change:+.2f}%"
                 )
+        
+        if lstm_pred is not None:
+            future_price = lstm_pred[-1]
+            change = (future_price - latest['Close']) / latest['Close'] * 100
+            with pred_cols[2]:
+                st.metric(
+                    f"🚀 LSTM予測 ({forecast_days}日後)",
+                    f"{future_price:.2f}",
+                    f"{change:+.2f}%"
+                )
     
     # チャート
     st.subheader("📈 チャート")
-    fig = create_chart(data, arima_pred, arima_ci, ml_pred, forecast_days)
+    fig = create_chart(data, arima_pred, arima_ci, ml_pred, lstm_pred, forecast_days)
     st.plotly_chart(fig, use_container_width=True)
     
     # 注意書き

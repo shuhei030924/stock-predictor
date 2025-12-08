@@ -17,3 +17,8 @@ scikit-learn>=1.0.0
 
 # Webアプリ
 streamlit>=1.20.0
+
+# 深層学習 (GPU対応)
+# CUDA対応版をインストールする場合は下記コマンドを使用:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+torch>=2.0.0

@@ -1,6 +1,6 @@
 # 📈 株価予測ツール (Stock Predictor)
 
-ARIMA + 機械学習 + テクニカル分析 を組み合わせた株価予測ツールです。
+ARIMA + 機械学習 + LSTM深層学習 + テクニカル分析 を組み合わせた株価予測ツールです。
 
 ## 🚀 機能
 
@@ -13,7 +13,25 @@ ARIMA + 機械学習 + テクニカル分析 を組み合わせた株価予測�
 - **予測モデル**:
   - ARIMA (自己回帰和分移動平均)
   - Random Forest (機械学習)
+  - 🚀 **LSTM (深層学習) - GPU対応!**
 - **売買シグナル**: 複数指標に基づく総合判断
+- **バックテスト**: 予測精度の検証ページ
+
+## 🎮 GPU対応 (NEW!)
+
+PyTorchを使用したLSTMモデルでGPU高速予測に対応しました！
+
+### GPU版のインストール
+
+```bash
+# CUDA 12.1 対応版
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# CUDA 11.8 対応版
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+GPUがない場合でもCPUで動作します。
 
 ## 📦 インストール
 
@@ -105,6 +123,11 @@ streamlit run app.py
 stock_predictor/
 ├── app.py              # Streamlit Webアプリ
 ├── stock_predictor.py  # コマンドライン版
+├── models/
+│   ├── __init__.py     # モジュール初期化
+│   └── lstm_model.py   # LSTM深層学習モデル (GPU対応)
+├── pages/
+│   └── 01_accuracy.py  # 予測精度検証ページ
 ├── requirements.txt    # 必要パッケージ
 └── README.md           # このファイル
 ```
@@ -115,5 +138,6 @@ stock_predictor/
 - **yfinance**: Yahoo Finance APIラッパー
 - **statsmodels**: ARIMA時系列モデル
 - **scikit-learn**: Random Forest機械学習
+- **PyTorch**: LSTM深層学習 (GPU対応)
 - **Streamlit**: Webアプリフレームワーク
 - **Plotly**: インタラクティブチャート

@@ -23,6 +23,16 @@ from statsmodels.tsa.arima.model import ARIMA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 
+# LSTM (PyTorch) インポート
+try:
+    import torch
+    import sys
+    sys.path.append('..')
+    from models.lstm_model import StockLSTMPredictor, get_device
+    PYTORCH_AVAILABLE = True
+except ImportError:
+    PYTORCH_AVAILABLE = False
+
 st.set_page_config(
     page_title="📊 予測精度検証",
     page_icon="📊",
@@ -182,8 +192,11 @@ def calculate_metrics(results_df: pd.DataFrame) -> dict:
     }
 
 
-def create_backtest_chart(arima_results: pd.DataFrame, ml_results: pd.DataFrame):
+def create_backtest_chart(arima_results: pd.DataFrame, ml_results: pd.DataFrame, lstm_results: pd.DataFrame = None):
     """バックテスト結果のチャートを作成"""
+    if lstm_results is None:
+        lstm_results = pd.DataFrame()
+        
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
@@ -230,6 +243,22 @@ def create_backtest_chart(arima_results: pd.DataFrame, ml_results: pd.DataFrame)
             name='ML累積誤差', line=dict(color='green')
         ), row=3, col=1)
     
+    if len(lstm_results) > 0:
+        fig.add_trace(go.Scatter(
+            x=lstm_results['Date'], y=lstm_results['Predicted'],
+            name='🚀 LSTM予測', line=dict(color='purple', dash='dash', width=2)
+        ), row=1, col=1)
+        
+        fig.add_trace(go.Bar(
+            x=lstm_results['Date'], y=lstm_results['Error_Pct'],
+            name='LSTM誤差', marker_color='purple', opacity=0.5
+        ), row=2, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=lstm_results['Date'], y=lstm_results['Error'].cumsum(),
+            name='LSTM累積誤差', line=dict(color='purple')
+        ), row=3, col=1)
+    
     fig.update_layout(height=800, showlegend=True)
     fig.add_hline(y=0, line_dash="dash", line_color="gray", row=2, col=1)
     fig.add_hline(y=0, line_dash="dash", line_color="gray", row=3, col=1)
@@ -256,6 +285,18 @@ test_days = st.sidebar.slider(
 run_arima = st.sidebar.checkbox("ARIMA", value=True)
 run_ml = st.sidebar.checkbox("機械学習", value=True)
 
+# LSTM (GPU対応) オプション
+if PYTORCH_AVAILABLE:
+    run_lstm = st.sidebar.checkbox("🚀 LSTM (GPU対応)", value=False)
+    if run_lstm:
+        if torch.cuda.is_available():
+            st.sidebar.success(f"🎮 GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            st.sidebar.info("💻 CPU モードで実行")
+        lstm_epochs = st.sidebar.slider("LSTMエポック数", 30, 100, 50)
+else:
+    run_lstm = False
+
 # 検証実行
 if st.sidebar.button("🔍 検証実行", type="primary"):
     with st.spinner("データを取得中..."):
@@ -266,6 +307,7 @@ if st.sidebar.button("🔍 検証実行", type="primary"):
     
     arima_results = pd.DataFrame()
     ml_results = pd.DataFrame()
+    lstm_results = pd.DataFrame()
     
     # ARIMA バックテスト
     if run_arima:
@@ -297,22 +339,53 @@ if st.sidebar.button("🔍 検証実行", type="primary"):
             cols[2].metric("MAPE", f"{ml_metrics['MAPE']:.2f}%")
             cols[3].metric("方向的中率", f"{ml_metrics['Direction_Accuracy']:.1f}%")
     
+    # LSTM バックテスト
+    if run_lstm and PYTORCH_AVAILABLE:
+        with st.spinner("🚀 LSTMバックテスト実行中（GPUを使用中）..."):
+            try:
+                predictor = StockLSTMPredictor(sequence_length=30, hidden_size=64)
+                lstm_results = predictor.backtest(data['Close'].values, test_days=test_days, train_epochs=lstm_epochs)
+                
+                if len(lstm_results) > 0:
+                    # 日付を追加
+                    lstm_results['Date'] = data.index[-len(lstm_results):].values
+                    lstm_metrics = calculate_metrics(lstm_results)
+                    
+                    device_name = "GPU" if torch.cuda.is_available() else "CPU"
+                    st.subheader(f"🚀 LSTM モデル精度 ({device_name}使用)")
+                    cols = st.columns(4)
+                    cols[0].metric("MAE", f"{lstm_metrics['MAE']:.2f}")
+                    cols[1].metric("RMSE", f"{lstm_metrics['RMSE']:.2f}")
+                    cols[2].metric("MAPE", f"{lstm_metrics['MAPE']:.2f}%")
+                    cols[3].metric("方向的中率", f"{lstm_metrics['Direction_Accuracy']:.1f}%")
+            except Exception as e:
+                st.error(f"❌ LSTMバックテストエラー: {e}")
+    
     # チャート
     st.subheader("📊 バックテスト結果")
-    fig = create_backtest_chart(arima_results, ml_results)
+    fig = create_backtest_chart(arima_results, ml_results, lstm_results if PYTORCH_AVAILABLE and run_lstm else pd.DataFrame())
     st.plotly_chart(fig, use_container_width=True)
     
     # 詳細データ
     with st.expander("📋 詳細データを表示"):
-        tab1, tab2 = st.tabs(["ARIMA", "機械学習"])
+        tabs = ["ARIMA", "機械学習"]
+        if run_lstm and PYTORCH_AVAILABLE:
+            tabs.append("LSTM")
         
-        with tab1:
+        tab_objects = st.tabs(tabs)
+        
+        with tab_objects[0]:
             if len(arima_results) > 0:
                 st.dataframe(arima_results.round(2), use_container_width=True)
         
-        with tab2:
+        with tab_objects[1]:
             if len(ml_results) > 0:
                 st.dataframe(ml_results.round(2), use_container_width=True)
+        
+        if run_lstm and PYTORCH_AVAILABLE and len(tabs) > 2:
+            with tab_objects[2]:
+                if len(lstm_results) > 0:
+                    st.dataframe(lstm_results.round(2), use_container_width=True)
     
     # 評価サマリー
     st.subheader("📝 評価サマリー")
