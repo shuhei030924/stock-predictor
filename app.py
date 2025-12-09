@@ -127,9 +127,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=3600)
-def fetch_stock_data(ticker: str, period: str) -> pd.DataFrame:
-    """株価データを取得（キャッシュ付き）"""
+def fetch_stock_data_from_api(ticker: str, period: str) -> pd.DataFrame:
+    """株価データをAPIから取得（内部用）"""
     yf, yf_available = load_yfinance()
     if yf_available:
         try:
@@ -142,7 +141,7 @@ def fetch_stock_data(ticker: str, period: str) -> pd.DataFrame:
         except:
             pass
     
-    # ダミーデータ
+    # ダミーデータ（APIが使えない場合）
     np.random.seed(hash(ticker) % 100)
     days = 500
     dates = pd.date_range(end=datetime.now(), periods=days, freq='B')
@@ -156,6 +155,31 @@ def fetch_stock_data(ticker: str, period: str) -> pd.DataFrame:
         'Close': price,
         'Volume': np.random.randint(1000000, 10000000, days)
     }, index=dates)
+
+
+def fetch_stock_data(ticker: str, period: str, use_smart_cache: bool = True):
+    """
+    株価データを取得（スマートキャッシュ対応）
+    
+    Returns:
+        tuple: (DataFrame, source) - sourceは "cache", "api", "stale_cache" のいずれか
+    """
+    # DBが使えない場合は直接API
+    if not db_available or not use_smart_cache:
+        return fetch_stock_data_from_api(ticker, period), "api"
+    
+    # スマートキャッシュを使用
+    try:
+        from services import smart_fetch_stock_data
+        return smart_fetch_stock_data(
+            ticker=ticker,
+            period=period,
+            db_manager=db,
+            api_fetch_func=fetch_stock_data_from_api,
+            cache_max_age_hours=6  # 6時間以内のキャッシュは再利用
+        )
+    except ImportError:
+        return fetch_stock_data_from_api(ticker, period), "api"
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -478,12 +502,40 @@ st.markdown("""
 ⚠️ **注意**: 予測は参考値です。株価の正確な予測は原理的に困難です。
 """)
 
+# データベース接続（遅延ロード）
+@st.cache_resource
+def load_database():
+    try:
+        from database import get_db
+        return get_db(), True
+    except ImportError:
+        return None, False
+
+db, db_available = load_database()
+
 # サイドバー
 st.sidebar.header("⚙️ 設定")
 
+# ウォッチリストから選択（DBが利用可能な場合）
+if db_available:
+    watchlist = db.get_watchlist()
+    if watchlist:
+        watchlist_options = ["直接入力"] + [f"{w['ticker']} - {w['name'] or ''}" for w in watchlist]
+        selected_from_watchlist = st.sidebar.selectbox("📋 ウォッチリストから選択", watchlist_options)
+        
+        if selected_from_watchlist != "直接入力":
+            default_ticker = selected_from_watchlist.split(" - ")[0]
+        else:
+            default_ticker = st.session_state.get('selected_ticker', 'AAPL')
+    else:
+        default_ticker = st.session_state.get('selected_ticker', 'AAPL')
+        st.sidebar.caption("📋 [ウォッチリストに銘柄を追加](/02_watchlist)")
+else:
+    default_ticker = 'AAPL'
+
 ticker = st.sidebar.text_input(
     "銘柄コード",
-    value="AAPL",
+    value=default_ticker,
     help="例: AAPL, GOOGL, 7203.T (トヨタ)"
 )
 
@@ -539,8 +591,28 @@ else:
 # 分析実行ボタン
 if st.sidebar.button("🔍 分析実行", type="primary"):
     with st.spinner("データを取得中..."):
-        data = fetch_stock_data(ticker, period)
+        data, data_source = fetch_stock_data(ticker, period)
         data = add_indicators(data)
+    
+    # データソースの表示
+    source_icons = {
+        "cache": "⚡ キャッシュ",
+        "api": "🌐 API",
+        "stale_cache": "📦 古いキャッシュ"
+    }
+    st.caption(f"データソース: {source_icons.get(data_source, data_source)}")
+    
+    # ウォッチリストに追加ボタン
+    if db_available:
+        # ウォッチリストに存在するかチェック
+        watchlist_tickers = [w['ticker'] for w in db.get_watchlist()]
+        if ticker.upper() not in watchlist_tickers:
+            if st.button(f"📋 {ticker.upper()} をウォッチリストに追加"):
+                db.add_to_watchlist(ticker)
+                st.success(f"✅ {ticker.upper()} をウォッチリストに追加しました")
+                st.rerun()
+        else:
+            st.caption(f"✅ {ticker.upper()} はウォッチリストに登録済み")
     
     # 基本情報
     col1, col2, col3, col4 = st.columns(4)
