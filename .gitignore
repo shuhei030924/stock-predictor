@@ -49,6 +49,10 @@ Thumbs.db
 *.xlsx
 !sample_data/*.csv
 
+# Database
+*.db
+data/
+
 # Model files
 *.pth
 *.pkl
