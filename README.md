@@ -1,37 +1,50 @@
 # 📈 株価予測ツール (Stock Predictor)
 
-ARIMA + 機械学習 + LSTM深層学習 + テクニカル分析 を組み合わせた株価予測ツールです。
+ARIMA + 機械学習 + LSTM深層学習 + テクニカル分析 を組み合わせた株価予測・分析ツールです。
 
 ## 🚀 機能
 
-- **データ取得**: yfinance を使用したリアルタイム株価データ取得
-- **テクニカル分析**: 
-  - 移動平均 (SMA)
-  - RSI (相対力指数)
-  - MACD
-  - ボリンジャーバンド
-- **予測モデル**:
-  - ARIMA (自己回帰和分移動平均)
-  - Random Forest (機械学習)
-  - 🚀 **LSTM (深層学習) - GPU対応!**
-- **売買シグナル**: 複数指標に基づく総合判断
-- **バックテスト**: 予測精度の検証ページ
+### 📊 株価予測
+- **ARIMA**: 自己回帰和分移動平均モデル
+- **Random Forest**: 機械学習アンサンブル
+- **LightGBM**: 勾配ブースティング
+- **GARCH**: ボラティリティ予測
+- **LSTM**: 深層学習 (GPU対応)
 
-## 🎮 GPU対応 (NEW!)
+### 📈 テクニカル分析
+- 移動平均 (SMA)
+- RSI (相対力指数)
+- MACD
+- ボリンジャーバンド
+- 売買シグナル生成
 
-PyTorchを使用したLSTMモデルでGPU高速予測に対応しました！
+### 💼 ポートフォリオ管理 (NEW!)
+- 保有株の登録・管理
+- リアルタイム損益計算
+- 資産配分の可視化
 
-### GPU版のインストール
+### 🔔 価格アラート (NEW!)
+- 目標価格でアラート設定
+- 条件達成時の通知
+
+### 📊 銘柄比較 (NEW!)
+- 最大5銘柄の比較分析
+- 相関係数ヒートマップ
+- パフォーマンス比較
+
+### ⚡ スマートキャッシュ
+- 株価データの自動キャッシュ
+- バックグラウンド更新
+- API負荷軽減
+
+## 🎮 GPU対応
+
+PyTorchを使用したLSTMモデルでGPU高速予測に対応！
 
 ```bash
 # CUDA 12.1 対応版
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-
-# CUDA 11.8 対応版
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
-
-GPUがない場合でもCPUで動作します。
 
 ## 📦 インストール
 
@@ -39,29 +52,36 @@ GPUがない場合でもCPUで動作します。
 # 仮想環境の作成（推奨）
 python -m venv venv
 venv\Scripts\activate  # Windows
-# source venv/bin/activate  # Mac/Linux
 
 # パッケージのインストール
 pip install -r requirements.txt
 ```
 
+または、`setup.bat` を実行してください。
+
 ## 🎮 使い方
 
-### 方法1: コマンドライン版
+### 方法1: バッチファイル（推奨）
 
-```bash
-python stock_predictor.py
-```
+`run.bat` をダブルクリック
 
-対話形式で銘柄コードと予測日数を入力できます。
-
-### 方法2: Webアプリ版（推奨）
+### 方法2: コマンドライン
 
 ```bash
 streamlit run app.py
 ```
 
-ブラウザが自動で開き、インタラクティブな分析画面が表示されます。
+## 📱 ページ構成
+
+| ページ | 説明 |
+|-------|------|
+| 🏠 メイン | 株価予測・テクニカル分析 |
+| 📊 精度評価 | 予測モデルの精度検証 |
+| 📋 ウォッチリスト | 銘柄の管理 |
+| 💾 データ管理 | キャッシュ管理 |
+| 📈 銘柄比較 | 複数銘柄の比較分析 |
+| 💼 ポートフォリオ | 保有株管理・損益計算 |
+| 🔔 アラート | 価格通知設定 |
 
 ## 📊 対応銘柄
 
@@ -121,15 +141,30 @@ streamlit run app.py
 
 ```
 stock_predictor/
-├── app.py              # Streamlit Webアプリ
-├── stock_predictor.py  # コマンドライン版
+├── app.py                    # メインWebアプリ
+├── stock_predictor.py        # コマンドライン版
+├── run.bat                   # 実行スクリプト
+├── setup.bat                 # セットアップスクリプト
+├── requirements.txt          # 依存パッケージ
 ├── models/
-│   ├── __init__.py     # モジュール初期化
-│   └── lstm_model.py   # LSTM深層学習モデル (GPU対応)
+│   ├── __init__.py
+│   └── lstm_model.py         # LSTM深層学習モデル
+├── database/
+│   ├── __init__.py
+│   └── db_manager.py         # SQLiteデータベース管理
+├── services/
+│   ├── __init__.py
+│   └── background_updater.py # バックグラウンド更新
 ├── pages/
-│   └── 01_accuracy.py  # 予測精度検証ページ
-├── requirements.txt    # 必要パッケージ
-└── README.md           # このファイル
+│   ├── 01_accuracy.py        # 予測精度検証
+│   ├── 02_watchlist.py       # ウォッチリスト管理
+│   ├── 03_data_management.py # データ管理
+│   ├── 04_compare.py         # 銘柄比較
+│   ├── 05_portfolio.py       # ポートフォリオ
+│   └── 06_alerts.py          # 価格アラート
+├── data/
+│   └── stock_predictor.db    # SQLiteデータベース
+└── README.md
 ```
 
 ## 📚 使用技術
@@ -138,6 +173,9 @@ stock_predictor/
 - **yfinance**: Yahoo Finance APIラッパー
 - **statsmodels**: ARIMA時系列モデル
 - **scikit-learn**: Random Forest機械学習
+- **LightGBM**: 勾配ブースティング
+- **arch**: GARCHボラティリティモデル
 - **PyTorch**: LSTM深層学習 (GPU対応)
 - **Streamlit**: Webアプリフレームワーク
 - **Plotly**: インタラクティブチャート
+- **SQLite**: ローカルデータベース
