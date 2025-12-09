@@ -15,10 +15,16 @@ plotly>=5.0.0
 statsmodels>=0.13.0
 scikit-learn>=1.0.0
 
+# 勾配ブースティング (推奨)
+lightgbm>=4.0.0
+
+# ボラティリティモデル
+arch>=6.0.0
+
 # Webアプリ
 streamlit>=1.20.0
 
-# 深層学習 (GPU対応)
+# 深層学習 (オプション - GPU対応)
 # CUDA対応版をインストールする場合は下記コマンドを使用:
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 torch>=2.0.0

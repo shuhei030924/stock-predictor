@@ -253,24 +253,3 @@ def check_gpu_availability():
         print("   Using CPU instead")
     
     print("=" * 50)
-
-
-if __name__ == "__main__":
-    # GPU確認
-    check_gpu_availability()
-    
-    # テスト用ダミーデータ
-    np.random.seed(42)
-    days = 500
-    returns = np.random.normal(0.0005, 0.02, days)
-    prices = 100 * np.exp(np.cumsum(returns))
-    
-    # 予測テスト
-    predictor = StockLSTMPredictor(sequence_length=30, hidden_size=64)
-    
-    print("\n訓練開始...")
-    losses = predictor.train(prices, epochs=50, verbose=True)
-    
-    print("\n予測実行...")
-    predictions = predictor.predict(prices, forecast_days=10)
-    print(f"10日間の予測: {predictions}")
