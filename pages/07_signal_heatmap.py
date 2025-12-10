@@ -223,13 +223,13 @@ def calculate_single_signal(ticker: str, use_cache: bool = True) -> dict:
     
     # ==================== 総合スコア計算 ====================
     
-    # 重み付け平均
+    # 重み付け平均（MACDを重視、出来高は補助的）
     weights = {
         'rsi': 0.20,
         'ma': 0.25,
-        'macd': 0.25,
+        'macd': 0.30,  # トレンド転換に最重要
         'bb': 0.15,
-        'volume': 0.15
+        'volume': 0.10  # 補助的指標
     }
     
     total_score = (
