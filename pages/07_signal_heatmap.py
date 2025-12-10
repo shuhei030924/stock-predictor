@@ -368,7 +368,7 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     st.divider()
     
     # ==================== ヒートマップ ====================
-    st.subheader("🔥 シグナルヒートマップ（セルをクリックで銘柄選択）")
+    st.subheader("🔥 シグナルヒートマップ（行をクリックで銘柄選択）")
     
     # Plotly遅延ロード
     import plotly.graph_objects as go
@@ -386,56 +386,54 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     # df_signalsのインデックスをリセット
     df_signals = df_signals.reset_index(drop=True)
     
-    # ヒートマップデータ準備
-    heatmap_data = df_signals[['ticker', 'rsi_signal', 'ma_signal', 'macd_signal', 'bb_signal', 'vol_signal', 'total_score']].copy()
-    heatmap_data = heatmap_data.set_index('ticker')
-    heatmap_data.columns = ['RSI', 'MA', 'MACD', 'BB', '出来高', '総合']
+    # ヒートマップ用データフレーム作成
+    heatmap_df = df_signals[['ticker', 'rsi_signal', 'ma_signal', 'macd_signal', 'bb_signal', 'vol_signal', 'total_score']].copy()
+    heatmap_df.columns = ['銘柄', 'RSI', 'MA', 'MACD', 'BB', '出来高', '総合']
     
-    # ヒートマップ作成（クリック対応）
-    fig = go.Figure(data=go.Heatmap(
-        z=heatmap_data.values,
-        x=heatmap_data.columns,
-        y=heatmap_data.index,
-        colorscale=[
-            [0, 'rgb(255, 0, 0)'],      # -1: 赤 (売り)
-            [0.5, 'rgb(255, 255, 255)'], # 0: 白 (中立)
-            [1, 'rgb(0, 200, 0)']        # +1: 緑 (買い)
-        ],
-        zmid=0,
-        zmin=-1,
-        zmax=1,
-        text=np.round(heatmap_data.values, 2),
-        texttemplate='%{text}',
-        textfont={"size": 11},
-        hovertemplate='<b>%{y}</b><br>%{x}: %{z:.2f}<br>クリックで詳細表示<extra></extra>'
-    ))
+    # スタイル関数（-1～+1を赤～緑にマッピング）
+    def color_signal(val):
+        if pd.isna(val) or not isinstance(val, (int, float)):
+            return ''
+        # -1: 赤, 0: 白, +1: 緑
+        if val > 0:
+            intensity = min(abs(val), 1) * 255
+            return f'background-color: rgba(0, {int(intensity)}, 0, 0.7); color: white'
+        elif val < 0:
+            intensity = min(abs(val), 1) * 255
+            return f'background-color: rgba({int(intensity)}, 0, 0, 0.7); color: white'
+        else:
+            return 'background-color: white'
     
-    fig.update_layout(
-        height=max(500, len(heatmap_data) * 30),
-        xaxis_title="指標",
-        yaxis_title="銘柄",
-        yaxis=dict(tickmode='linear'),
-        margin=dict(l=100, r=20, t=20, b=40)
-    )
+    # スタイル適用
+    styled_heatmap = heatmap_df.style.applymap(
+        color_signal, 
+        subset=['RSI', 'MA', 'MACD', 'BB', '出来高', '総合']
+    ).format({
+        'RSI': '{:.2f}',
+        'MA': '{:.2f}',
+        'MACD': '{:.2f}',
+        'BB': '{:.2f}',
+        '出来高': '{:.2f}',
+        '総合': '{:.2f}'
+    })
     
-    # クリックイベント対応でヒートマップ表示
-    clicked = st.plotly_chart(
-        fig, 
-        use_container_width=True, 
+    # クリック可能なDataFrameとして表示
+    clicked_heatmap = st.dataframe(
+        styled_heatmap,
+        use_container_width=True,
+        hide_index=True,
+        height=min(600, len(heatmap_df) * 35 + 40),
         on_select="rerun",
-        selection_mode="points",
-        key="heatmap_click"
+        selection_mode="single-row"
     )
     
-    # クリックされたポイントから銘柄を取得
-    if clicked and clicked.selection and clicked.selection.points:
-        point = clicked.selection.points[0]
-        if 'y' in point:
-            clicked_ticker = point['y']
-            # 銘柄が変わった場合のみ更新
-            if clicked_ticker != st.session_state.get('selected_ticker'):
-                st.session_state['selected_ticker'] = clicked_ticker
-                st.rerun()
+    # クリックされた行から銘柄を取得
+    if clicked_heatmap.selection and clicked_heatmap.selection.rows:
+        selected_row_idx = clicked_heatmap.selection.rows[0]
+        clicked_ticker = heatmap_df.iloc[selected_row_idx]['銘柄']
+        if clicked_ticker != st.session_state.get('selected_ticker'):
+            st.session_state['selected_ticker'] = clicked_ticker
+            st.rerun()
     
     # ==================== 銘柄詳細表示 ====================
     st.divider()
