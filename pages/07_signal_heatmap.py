@@ -368,7 +368,7 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     st.divider()
     
     # ==================== ヒートマップ ====================
-    st.subheader("🔥 シグナルヒートマップ（行をクリックで銘柄選択）")
+    st.subheader("🔥 シグナルヒートマップ（行をクリックで詳細をモーダル表示）")
     
     # Plotly遅延ロード
     import plotly.graph_objects as go
@@ -386,9 +386,11 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     # df_signalsのインデックスをリセット
     df_signals = df_signals.reset_index(drop=True)
     
-    # ヒートマップ用データフレーム作成
-    heatmap_df = df_signals[['ticker', 'rsi_signal', 'ma_signal', 'macd_signal', 'bb_signal', 'vol_signal', 'total_score']].copy()
-    heatmap_df.columns = ['銘柄', 'RSI', 'MA', 'MACD', 'BB', '出来高', '総合']
+    # ヒートマップ用データフレーム作成（情報追加: 銘柄名、価格、変動率）
+    heatmap_df = df_signals[['ticker', 'name', 'price', 'change', 'rsi_signal', 'ma_signal', 'macd_signal', 'bb_signal', 'vol_signal', 'total_score']].copy()
+    heatmap_df['price'] = heatmap_df['price'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "-")
+    heatmap_df['change'] = heatmap_df['change'].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-")
+    heatmap_df.columns = ['銘柄', '銘柄名', '価格', '変動率', 'RSI', 'MA', 'MACD', 'BB', '出来高', '総合']
     
     # スタイル関数（-1～+1を赤～緑にマッピング）
     def color_signal(val):
@@ -404,10 +406,27 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         else:
             return 'background-color: white'
     
+    # 変動率の色分け
+    def color_change(val):
+        if pd.isna(val) or not isinstance(val, str):
+            return ''
+        try:
+            num = float(val.replace('%', '').replace('+', ''))
+            if num > 0:
+                return 'color: green; font-weight: bold'
+            elif num < 0:
+                return 'color: red; font-weight: bold'
+        except:
+            pass
+        return ''
+    
     # スタイル適用
     styled_heatmap = heatmap_df.style.applymap(
         color_signal, 
         subset=['RSI', 'MA', 'MACD', 'BB', '出来高', '総合']
+    ).applymap(
+        color_change,
+        subset=['変動率']
     ).format({
         'RSI': '{:.2f}',
         'MA': '{:.2f}',
@@ -427,73 +446,44 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         selection_mode="single-row"
     )
     
-    # クリックされた行から銘柄を取得
-    if clicked_heatmap.selection and clicked_heatmap.selection.rows:
-        selected_row_idx = clicked_heatmap.selection.rows[0]
-        clicked_ticker = heatmap_df.iloc[selected_row_idx]['銘柄']
-        if clicked_ticker != st.session_state.get('selected_ticker'):
-            st.session_state['selected_ticker'] = clicked_ticker
-            st.rerun()
-    
-    # ==================== 銘柄詳細表示 ====================
-    st.divider()
-    st.subheader("🔍 銘柄詳細トレンド")
-    
-    # 銘柄選択用のデータ
-    ticker_list = df_signals['ticker'].tolist()
-    ticker_names_map = {t: ticker_names.get(t, '') for t in ticker_list}
-    
-    # 初期値設定
-    if 'selected_ticker' not in st.session_state or st.session_state['selected_ticker'] not in ticker_list:
-        st.session_state['selected_ticker'] = ticker_list[0] if ticker_list else None
-    
-    # 現在選択中の銘柄
-    selected_ticker = st.session_state.get('selected_ticker')
-    
-    if selected_ticker and selected_ticker in ticker_list:
-        st.success(f"📌 選択中: **{selected_ticker}** - {ticker_names_map.get(selected_ticker, '')}　（ヒートマップ横のボタン・テーブル・TOP5から変更可能）")
+    # ==================== モーダルダイアログ定義 ====================
+    @st.dialog("📊 銘柄詳細", width="large")
+    def show_ticker_detail(ticker: str, ticker_name: str, signal_row: pd.Series):
+        """モーダルダイアログで銘柄詳細を表示"""
+        st.markdown(f"## {ticker} - {ticker_name}")
+        
+        # 基本情報
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(
+            "現在値", 
+            f"${signal_row['price']:.2f}" if pd.notna(signal_row['price']) else "-",
+            f"{signal_row['change']:+.2f}%" if pd.notna(signal_row['change']) else None
+        )
+        col2.metric("RSI", f"{signal_row['rsi']:.1f}" if pd.notna(signal_row['rsi']) else "-")
+        col3.metric("総合スコア", f"{signal_row['total_score']:+.2f}" if pd.notna(signal_row['total_score']) else "-")
+        
+        # 判定
+        score = signal_row['total_score'] if pd.notna(signal_row['total_score']) else 0
+        if score > 0.5:
+            col4.metric("判定", "🟢 強い買い")
+        elif score > 0:
+            col4.metric("判定", "🔵 買い")
+        elif score > -0.5:
+            col4.metric("判定", "🟠 売り")
+        else:
+            col4.metric("判定", "🔴 強い売り")
         
         # 詳細データ取得
-        with st.spinner(f"{selected_ticker} のトレンドを取得中..."):
-            detail_data = get_ticker_detail(selected_ticker)
+        with st.spinner(f"{ticker} のトレンドを取得中..."):
+            detail_data = get_ticker_detail(ticker)
         
         if detail_data:
-            # 基本情報
-            col1, col2, col3, col4 = st.columns(4)
-            
-            signal_rows = df_signals[df_signals['ticker'] == selected_ticker]
-            if len(signal_rows) == 0:
-                st.error("データが見つかりません")
-                st.stop()
-            signal_row = signal_rows.iloc[0]
-            
-            col1.metric(
-                "現在値", 
-                f"${signal_row['price']:.2f}" if pd.notna(signal_row['price']) else "-",
-                f"{signal_row['change']:+.2f}%" if pd.notna(signal_row['change']) else None
-            )
-            col2.metric("RSI", f"{signal_row['rsi']:.1f}" if pd.notna(signal_row['rsi']) else "-")
-            col3.metric("総合スコア", f"{signal_row['total_score']:+.2f}" if pd.notna(signal_row['total_score']) else "-")
-            
-            # 判定
-            score = signal_row['total_score'] if pd.notna(signal_row['total_score']) else 0
-            if score > 0.5:
-                col4.metric("判定", "🟢 強い買い")
-            elif score > 0:
-                col4.metric("判定", "🔵 買い")
-            elif score > -0.5:
-                col4.metric("判定", "🟠 売り")
-            else:
-                col4.metric("判定", "🔴 強い売り")
-            
             # チャートタブ
-            tab1, tab2, tab3 = st.tabs(["📈 価格チャート", "📊 テクニカル指標", "📉 シグナル履歴"])
+            tab1, tab2, tab3 = st.tabs(["📈 価格チャート", "📊 テクニカル", "📉 シグナル詳細"])
             
             with tab1:
-                # 価格チャート + 移動平均
+                # ローソク足チャート
                 fig_price = go.Figure()
-                
-                # ローソク足
                 fig_price.add_trace(go.Candlestick(
                     x=detail_data['df'].index,
                     open=detail_data['df']['Open'],
@@ -502,107 +492,31 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
                     close=detail_data['df']['Close'],
                     name='価格'
                 ))
-                
-                # 移動平均線
-                fig_price.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['sma5'],
-                    name='SMA5',
-                    line=dict(color='orange', width=1)
-                ))
-                fig_price.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['sma20'],
-                    name='SMA20',
-                    line=dict(color='blue', width=1)
-                ))
-                fig_price.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['sma50'],
-                    name='SMA50',
-                    line=dict(color='purple', width=1)
-                ))
-                
-                # ボリンジャーバンド
-                fig_price.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['bb_upper'],
-                    name='BB上限',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    opacity=0.5
-                ))
-                fig_price.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['bb_lower'],
-                    name='BB下限',
-                    line=dict(color='gray', width=1, dash='dash'),
-                    fill='tonexty',
-                    fillcolor='rgba(128,128,128,0.1)',
-                    opacity=0.5
-                ))
-                
-                fig_price.update_layout(
-                    title=f"{selected_ticker} 価格チャート",
-                    height=500,
-                    xaxis_rangeslider_visible=False,
-                    hovermode='x unified'
-                )
+                fig_price.add_trace(go.Scatter(x=detail_data['df'].index, y=detail_data['sma20'], name='SMA20', line=dict(color='blue', width=1)))
+                fig_price.add_trace(go.Scatter(x=detail_data['df'].index, y=detail_data['sma50'], name='SMA50', line=dict(color='purple', width=1)))
+                fig_price.update_layout(height=400, xaxis_rangeslider_visible=False, hovermode='x unified')
                 st.plotly_chart(fig_price, use_container_width=True)
             
             with tab2:
-                # RSI
-                fig_rsi = go.Figure()
-                fig_rsi.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['rsi'],
-                    name='RSI',
-                    line=dict(color='purple')
-                ))
-                fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="買われすぎ")
-                fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="売られすぎ")
-                fig_rsi.update_layout(title="RSI (14日)", height=250, yaxis=dict(range=[0, 100]))
-                st.plotly_chart(fig_rsi, use_container_width=True)
-                
-                # MACD
-                fig_macd = go.Figure()
-                fig_macd.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['macd'],
-                    name='MACD',
-                    line=dict(color='blue')
-                ))
-                fig_macd.add_trace(go.Scatter(
-                    x=detail_data['df'].index,
-                    y=detail_data['macd_signal'],
-                    name='シグナル',
-                    line=dict(color='orange')
-                ))
-                fig_macd.add_trace(go.Bar(
-                    x=detail_data['df'].index,
-                    y=detail_data['macd_hist'],
-                    name='ヒストグラム',
-                    marker_color=['green' if v >= 0 else 'red' for v in detail_data['macd_hist']]
-                ))
-                fig_macd.update_layout(title="MACD", height=250)
-                st.plotly_chart(fig_macd, use_container_width=True)
-                
-                # 出来高
-                fig_vol = go.Figure()
-                colors = ['green' if detail_data['df']['Close'].iloc[i] >= detail_data['df']['Open'].iloc[i] 
-                          else 'red' for i in range(len(detail_data['df']))]
-                fig_vol.add_trace(go.Bar(
-                    x=detail_data['df'].index,
-                    y=detail_data['df']['Volume'],
-                    name='出来高',
-                    marker_color=colors
-                ))
-                fig_vol.update_layout(title="出来高", height=200)
-                st.plotly_chart(fig_vol, use_container_width=True)
+                col_l, col_r = st.columns(2)
+                with col_l:
+                    # RSI
+                    fig_rsi = go.Figure()
+                    fig_rsi.add_trace(go.Scatter(x=detail_data['df'].index, y=detail_data['rsi'], name='RSI', line=dict(color='purple')))
+                    fig_rsi.add_hline(y=70, line_dash="dash", line_color="red")
+                    fig_rsi.add_hline(y=30, line_dash="dash", line_color="green")
+                    fig_rsi.update_layout(title="RSI", height=200, yaxis=dict(range=[0, 100]))
+                    st.plotly_chart(fig_rsi, use_container_width=True)
+                with col_r:
+                    # MACD
+                    fig_macd = go.Figure()
+                    fig_macd.add_trace(go.Scatter(x=detail_data['df'].index, y=detail_data['macd'], name='MACD', line=dict(color='blue')))
+                    fig_macd.add_trace(go.Scatter(x=detail_data['df'].index, y=detail_data['macd_signal'], name='Signal', line=dict(color='orange')))
+                    fig_macd.update_layout(title="MACD", height=200)
+                    st.plotly_chart(fig_macd, use_container_width=True)
             
             with tab3:
-                # 各指標のシグナル詳細
-                st.markdown("### 📊 シグナル詳細")
-                
+                # シグナル詳細
                 signal_details = [
                     ("RSI", signal_row['rsi_signal'], f"RSI = {signal_row['rsi']:.1f}"),
                     ("移動平均", signal_row['ma_signal'], "短期>長期なら買い"),
@@ -610,24 +524,31 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
                     ("ボリンジャーバンド", signal_row['bb_signal'], "下限付近なら買い"),
                     ("出来高", signal_row['vol_signal'], "出来高増+価格上昇なら買い"),
                 ]
-                
                 for name, value, desc in signal_details:
-                    col1, col2, col3 = st.columns([2, 2, 4])
-                    col1.write(f"**{name}**")
-                    
-                    # スコアバー
-                    if value > 0:
-                        bar = "🟩" * int(value * 5) + "⬜" * (5 - int(value * 5))
-                    else:
-                        bar = "⬜" * (5 + int(value * 5)) + "🟥" * (-int(value * 5))
-                    col2.write(f"{bar} {value:+.2f}")
-                    col3.caption(desc)
-                
-                st.markdown("---")
-                st.markdown(f"**総合スコア: {signal_row['total_score']:+.2f}**")
+                    c1, c2, c3 = st.columns([2, 2, 4])
+                    c1.write(f"**{name}**")
+                    bar = "🟩" * max(0, int((value + 1) * 2.5)) + "🟥" * max(0, int((1 - value) * 2.5))
+                    c2.write(f"{value:+.2f}")
+                    c3.caption(desc)
+                st.markdown(f"### 総合スコア: {signal_row['total_score']:+.2f}")
         else:
             st.error("データの取得に失敗しました")
+        
+        if st.button("閉じる", type="primary", use_container_width=True):
+            st.rerun()
     
+    # クリックされた行から銘柄を取得してモーダル表示
+    if clicked_heatmap.selection and clicked_heatmap.selection.rows:
+        selected_row_idx = clicked_heatmap.selection.rows[0]
+        clicked_ticker = df_signals.iloc[selected_row_idx]['ticker']
+        clicked_name = df_signals.iloc[selected_row_idx]['name'] or ''
+        clicked_signal_row = df_signals.iloc[selected_row_idx]
+        show_ticker_detail(clicked_ticker, clicked_name, clicked_signal_row)
+    
+    # ==================== 銘柄選択用データ ====================
+    ticker_list = df_signals['ticker'].tolist()
+    ticker_names_map = {t: ticker_names.get(t, '') for t in ticker_list}
+        
     st.divider()
     
     # ==================== 詳細テーブル ====================
@@ -667,40 +588,33 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         selection_mode="single-row"
     )
     
-    # テーブルで選択された銘柄を詳細表示
+    # テーブルで選択された銘柄をモーダル表示
     if event.selection and event.selection.rows:
         selected_row_idx = event.selection.rows[0]
         clicked_ticker = df_signals.iloc[selected_row_idx]['ticker']
-        if st.session_state.get('selected_ticker') != clicked_ticker:
-            st.session_state['selected_ticker'] = clicked_ticker
-            st.rerun()
+        clicked_name = df_signals.iloc[selected_row_idx]['name'] or ''
+        clicked_signal_row = df_signals.iloc[selected_row_idx]
+        show_ticker_detail(clicked_ticker, clicked_name, clicked_signal_row)
     
     # ==================== トップ銘柄 ====================
-    st.subheader("🏆⚠️ シグナルTOP5（クリックで詳細表示）")
+    st.subheader("🏆⚠️ シグナルTOP5（クリックで詳細モーダル表示）")
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("**🟢 買いシグナル**")
-        top_buy = df_signals.nlargest(5, 'total_score')[['ticker', 'name', 'total_score', 'change']]
-        for _, row in top_buy.iterrows():
-            score_bar = "🟩" * max(1, int((row['total_score'] + 1) * 2.5))
-            is_selected = (st.session_state.get('selected_ticker') == row['ticker'])
-            btn_label = f"{'→ ' if is_selected else ''}📈 {row['ticker']} ({row['total_score']:+.2f})"
+        st.markdown("**🟢 買いシグナルTOP5**")
+        top_buy = df_signals.nlargest(5, 'total_score')
+        for idx, row in top_buy.iterrows():
+            btn_label = f"📈 {row['ticker']} - {row['name'] or ''} ({row['total_score']:+.2f})"
             if st.button(btn_label, key=f"buy_{row['ticker']}", use_container_width=True):
-                st.session_state['selected_ticker'] = row['ticker']
-                st.rerun()
+                show_ticker_detail(row['ticker'], row['name'] or '', row)
     
     with col2:
-        st.markdown("**🔴 売りシグナル**")
-        top_sell = df_signals.nsmallest(5, 'total_score')[['ticker', 'name', 'total_score', 'change']]
-        for _, row in top_sell.iterrows():
-            score_bar = "🟥" * max(1, int((1 - row['total_score']) * 2.5))
-            is_selected = (st.session_state.get('selected_ticker') == row['ticker'])
-            btn_label = f"{'→ ' if is_selected else ''}📉 {row['ticker']} ({row['total_score']:+.2f})"
+        st.markdown("**🔴 売りシグナルTOP5**")
+        top_sell = df_signals.nsmallest(5, 'total_score')
+        for idx, row in top_sell.iterrows():
+            btn_label = f"📉 {row['ticker']} - {row['name'] or ''} ({row['total_score']:+.2f})"
             if st.button(btn_label, key=f"sell_{row['ticker']}", use_container_width=True):
-                st.session_state['selected_ticker'] = row['ticker']
-                st.rerun()
-            st.caption(f"{row['name'] or ''} | {score_bar} スコア: {row['total_score']:+.2f}")
+                show_ticker_detail(row['ticker'], row['name'] or '', row)
 
 else:
     st.info("👆 「シグナル更新」ボタンを押してデータを取得してください")
