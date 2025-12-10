@@ -537,13 +537,12 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         if st.button("閉じる", type="primary", use_container_width=True):
             st.rerun()
     
-    # クリックされた行から銘柄を取得してモーダル表示
+    # クリックされた行から銘柄を取得（session_stateに保存）
     if clicked_heatmap.selection and clicked_heatmap.selection.rows:
         selected_row_idx = clicked_heatmap.selection.rows[0]
         clicked_ticker = df_signals.iloc[selected_row_idx]['ticker']
-        clicked_name = df_signals.iloc[selected_row_idx]['name'] or ''
-        clicked_signal_row = df_signals.iloc[selected_row_idx]
-        show_ticker_detail(clicked_ticker, clicked_name, clicked_signal_row)
+        st.session_state['modal_ticker'] = clicked_ticker
+        st.session_state['modal_ticker_idx'] = selected_row_idx
     
     # ==================== 銘柄選択用データ ====================
     ticker_list = df_signals['ticker'].tolist()
@@ -579,22 +578,12 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     display_df['RSI'] = display_df['RSI'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
     display_df['総合スコア'] = display_df['総合スコア'].apply(lambda x: f"{x:+.2f}")
     
-    # クリック可能なテーブル
-    event = st.dataframe(
+    # テーブル表示（選択なし - ヒートマップで選択）
+    st.dataframe(
         display_df[['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア', '判定']],
         use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row"
+        hide_index=True
     )
-    
-    # テーブルで選択された銘柄をモーダル表示
-    if event.selection and event.selection.rows:
-        selected_row_idx = event.selection.rows[0]
-        clicked_ticker = df_signals.iloc[selected_row_idx]['ticker']
-        clicked_name = df_signals.iloc[selected_row_idx]['name'] or ''
-        clicked_signal_row = df_signals.iloc[selected_row_idx]
-        show_ticker_detail(clicked_ticker, clicked_name, clicked_signal_row)
     
     # ==================== トップ銘柄 ====================
     st.subheader("🏆⚠️ シグナルTOP5（クリックで詳細モーダル表示）")
@@ -603,18 +592,37 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     with col1:
         st.markdown("**🟢 買いシグナルTOP5**")
         top_buy = df_signals.nlargest(5, 'total_score')
-        for idx, row in top_buy.iterrows():
+        for idx, (orig_idx, row) in enumerate(top_buy.iterrows()):
             btn_label = f"📈 {row['ticker']} - {row['name'] or ''} ({row['total_score']:+.2f})"
             if st.button(btn_label, key=f"buy_{row['ticker']}", use_container_width=True):
-                show_ticker_detail(row['ticker'], row['name'] or '', row)
+                st.session_state['modal_ticker'] = row['ticker']
+                # df_signalsでのインデックスを探す
+                st.session_state['modal_ticker_idx'] = df_signals[df_signals['ticker'] == row['ticker']].index[0]
+                st.rerun()
     
     with col2:
         st.markdown("**🔴 売りシグナルTOP5**")
         top_sell = df_signals.nsmallest(5, 'total_score')
-        for idx, row in top_sell.iterrows():
+        for idx, (orig_idx, row) in enumerate(top_sell.iterrows()):
             btn_label = f"📉 {row['ticker']} - {row['name'] or ''} ({row['total_score']:+.2f})"
             if st.button(btn_label, key=f"sell_{row['ticker']}", use_container_width=True):
-                show_ticker_detail(row['ticker'], row['name'] or '', row)
+                st.session_state['modal_ticker'] = row['ticker']
+                st.session_state['modal_ticker_idx'] = df_signals[df_signals['ticker'] == row['ticker']].index[0]
+                st.rerun()
+    
+    # ==================== モーダル表示（1か所で制御） ====================
+    if 'modal_ticker' in st.session_state and st.session_state['modal_ticker']:
+        modal_ticker = st.session_state['modal_ticker']
+        modal_idx = st.session_state.get('modal_ticker_idx', 0)
+        
+        # df_signalsから該当行を取得
+        modal_rows = df_signals[df_signals['ticker'] == modal_ticker]
+        if len(modal_rows) > 0:
+            modal_row = modal_rows.iloc[0]
+            modal_name = modal_row['name'] or ''
+            show_ticker_detail(modal_ticker, modal_name, modal_row)
+            # モーダルを閉じた後にリセット
+            st.session_state['modal_ticker'] = None
 
 else:
     st.info("👆 「シグナル更新」ボタンを押してデータを取得してください")
