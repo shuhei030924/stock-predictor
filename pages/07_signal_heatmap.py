@@ -374,17 +374,8 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     import plotly.graph_objects as go
     import plotly.express as px
     
-    # ソート
-    sort_by = st.selectbox("ソート", ["総合スコア", "RSI", "価格変動率"], index=0)
-    if sort_by == "総合スコア":
-        df_signals = df_signals.sort_values('total_score', ascending=False)
-    elif sort_by == "RSI":
-        df_signals = df_signals.sort_values('rsi')
-    else:
-        df_signals = df_signals.sort_values('change', ascending=False)
-    
-    # df_signalsのインデックスをリセット
-    df_signals = df_signals.reset_index(drop=True)
+    # デフォルトは総合スコア降順
+    df_signals = df_signals.sort_values('total_score', ascending=False).reset_index(drop=True)
     
     # ヒートマップ用データフレーム作成（情報追加: 銘柄名、価格、変動率）
     heatmap_df = df_signals[['ticker', 'name', 'price', 'change', 'rsi_signal', 'ma_signal', 'macd_signal', 'bb_signal', 'vol_signal', 'total_score']].copy()
