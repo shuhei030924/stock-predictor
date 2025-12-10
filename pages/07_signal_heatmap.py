@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from database import get_db
+from database.db_manager import DatabaseManager
 
 st.set_page_config(
     page_title="🔥 シグナルヒートマップ",
@@ -25,8 +25,8 @@ st.set_page_config(
 st.title("🔥 シグナルヒートマップ")
 st.markdown("ウォッチリスト全銘柄の売買シグナルを一覧表示")
 
-# データベース接続
-db = get_db()
+# データベース接続（新規インスタンス）
+db = DatabaseManager()
 
 # ==================== キャッシュ付きテクニカル計算 ====================
 
@@ -50,6 +50,62 @@ def calculate_signals_batch(tickers: tuple, use_cache: bool = True) -> dict:
                 results[ticker] = result
     
     return results
+
+
+@st.cache_data(ttl=1800)  # 30分キャッシュ
+def get_ticker_detail(ticker: str) -> dict:
+    """銘柄の詳細テクニカルデータを取得"""
+    import ssl
+    ssl._create_default_https_context = ssl._create_unverified_context
+    
+    try:
+        import yfinance as yf
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="6mo")
+        
+        if df is None or len(df) < 50:
+            return None
+        
+        # テクニカル指標計算
+        # RSI
+        delta = df['Close'].diff()
+        gain = delta.where(delta > 0, 0).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        # 移動平均
+        sma5 = df['Close'].rolling(window=5).mean()
+        sma20 = df['Close'].rolling(window=20).mean()
+        sma50 = df['Close'].rolling(window=50).mean()
+        
+        # ボリンジャーバンド
+        bb_std = df['Close'].rolling(window=20).std()
+        bb_upper = sma20 + 2 * bb_std
+        bb_lower = sma20 - 2 * bb_std
+        
+        # MACD
+        ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
+        macd_hist = macd - macd_signal
+        
+        return {
+            'df': df,
+            'rsi': rsi,
+            'sma5': sma5,
+            'sma20': sma20,
+            'sma50': sma50,
+            'bb_upper': bb_upper,
+            'bb_lower': bb_lower,
+            'macd': macd,
+            'macd_signal': macd_signal,
+            'macd_hist': macd_hist
+        }
+    except Exception as e:
+        print(f"Error getting detail for {ticker}: {e}")
+        return None
 
 
 def calculate_single_signal(ticker: str, use_cache: bool = True) -> dict:
@@ -359,6 +415,196 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     )
     
     st.plotly_chart(fig, use_container_width=True)
+    
+    # ==================== 銘柄詳細表示 ====================
+    st.divider()
+    st.subheader("🔍 銘柄詳細トレンド")
+    
+    # 銘柄選択
+    ticker_list = df_signals['ticker'].tolist()
+    ticker_options = [f"{t} - {ticker_names.get(t, '')}" for t in ticker_list]
+    
+    selected_detail = st.selectbox(
+        "詳細を見る銘柄を選択", 
+        options=ticker_options,
+        key="detail_ticker"
+    )
+    
+    if selected_detail:
+        selected_ticker = selected_detail.split(" - ")[0]
+        
+        # 詳細データ取得
+        with st.spinner(f"{selected_ticker} のトレンドを取得中..."):
+            detail_data = get_ticker_detail(selected_ticker)
+        
+        if detail_data:
+            # 基本情報
+            col1, col2, col3, col4 = st.columns(4)
+            
+            signal_row = df_signals[df_signals['ticker'] == selected_ticker].iloc[0]
+            
+            col1.metric(
+                "現在値", 
+                f"${signal_row['price']:.2f}",
+                f"{signal_row['change']:+.2f}%"
+            )
+            col2.metric("RSI", f"{signal_row['rsi']:.1f}")
+            col3.metric("総合スコア", f"{signal_row['total_score']:+.2f}")
+            
+            # 判定
+            score = signal_row['total_score']
+            if score > 0.5:
+                col4.metric("判定", "🟢 強い買い")
+            elif score > 0:
+                col4.metric("判定", "🔵 買い")
+            elif score > -0.5:
+                col4.metric("判定", "🟠 売り")
+            else:
+                col4.metric("判定", "🔴 強い売り")
+            
+            # チャートタブ
+            tab1, tab2, tab3 = st.tabs(["📈 価格チャート", "📊 テクニカル指標", "📉 シグナル履歴"])
+            
+            with tab1:
+                # 価格チャート + 移動平均
+                fig_price = go.Figure()
+                
+                # ローソク足
+                fig_price.add_trace(go.Candlestick(
+                    x=detail_data['df'].index,
+                    open=detail_data['df']['Open'],
+                    high=detail_data['df']['High'],
+                    low=detail_data['df']['Low'],
+                    close=detail_data['df']['Close'],
+                    name='価格'
+                ))
+                
+                # 移動平均線
+                fig_price.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['sma5'],
+                    name='SMA5',
+                    line=dict(color='orange', width=1)
+                ))
+                fig_price.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['sma20'],
+                    name='SMA20',
+                    line=dict(color='blue', width=1)
+                ))
+                fig_price.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['sma50'],
+                    name='SMA50',
+                    line=dict(color='purple', width=1)
+                ))
+                
+                # ボリンジャーバンド
+                fig_price.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['bb_upper'],
+                    name='BB上限',
+                    line=dict(color='gray', width=1, dash='dash'),
+                    opacity=0.5
+                ))
+                fig_price.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['bb_lower'],
+                    name='BB下限',
+                    line=dict(color='gray', width=1, dash='dash'),
+                    fill='tonexty',
+                    fillcolor='rgba(128,128,128,0.1)',
+                    opacity=0.5
+                ))
+                
+                fig_price.update_layout(
+                    title=f"{selected_ticker} 価格チャート",
+                    height=500,
+                    xaxis_rangeslider_visible=False,
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_price, use_container_width=True)
+            
+            with tab2:
+                # RSI
+                fig_rsi = go.Figure()
+                fig_rsi.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['rsi'],
+                    name='RSI',
+                    line=dict(color='purple')
+                ))
+                fig_rsi.add_hline(y=70, line_dash="dash", line_color="red", annotation_text="買われすぎ")
+                fig_rsi.add_hline(y=30, line_dash="dash", line_color="green", annotation_text="売られすぎ")
+                fig_rsi.update_layout(title="RSI (14日)", height=250, yaxis=dict(range=[0, 100]))
+                st.plotly_chart(fig_rsi, use_container_width=True)
+                
+                # MACD
+                fig_macd = go.Figure()
+                fig_macd.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['macd'],
+                    name='MACD',
+                    line=dict(color='blue')
+                ))
+                fig_macd.add_trace(go.Scatter(
+                    x=detail_data['df'].index,
+                    y=detail_data['macd_signal'],
+                    name='シグナル',
+                    line=dict(color='orange')
+                ))
+                fig_macd.add_trace(go.Bar(
+                    x=detail_data['df'].index,
+                    y=detail_data['macd_hist'],
+                    name='ヒストグラム',
+                    marker_color=['green' if v >= 0 else 'red' for v in detail_data['macd_hist']]
+                ))
+                fig_macd.update_layout(title="MACD", height=250)
+                st.plotly_chart(fig_macd, use_container_width=True)
+                
+                # 出来高
+                fig_vol = go.Figure()
+                colors = ['green' if detail_data['df']['Close'].iloc[i] >= detail_data['df']['Open'].iloc[i] 
+                          else 'red' for i in range(len(detail_data['df']))]
+                fig_vol.add_trace(go.Bar(
+                    x=detail_data['df'].index,
+                    y=detail_data['df']['Volume'],
+                    name='出来高',
+                    marker_color=colors
+                ))
+                fig_vol.update_layout(title="出来高", height=200)
+                st.plotly_chart(fig_vol, use_container_width=True)
+            
+            with tab3:
+                # 各指標のシグナル詳細
+                st.markdown("### 📊 シグナル詳細")
+                
+                signal_details = [
+                    ("RSI", signal_row['rsi_signal'], f"RSI = {signal_row['rsi']:.1f}"),
+                    ("移動平均", signal_row['ma_signal'], "短期>長期なら買い"),
+                    ("MACD", signal_row['macd_signal'], "MACD>シグナルなら買い"),
+                    ("ボリンジャーバンド", signal_row['bb_signal'], "下限付近なら買い"),
+                    ("出来高", signal_row['vol_signal'], "出来高増+価格上昇なら買い"),
+                ]
+                
+                for name, value, desc in signal_details:
+                    col1, col2, col3 = st.columns([2, 2, 4])
+                    col1.write(f"**{name}**")
+                    
+                    # スコアバー
+                    if value > 0:
+                        bar = "🟩" * int(value * 5) + "⬜" * (5 - int(value * 5))
+                    else:
+                        bar = "⬜" * (5 + int(value * 5)) + "🟥" * (-int(value * 5))
+                    col2.write(f"{bar} {value:+.2f}")
+                    col3.caption(desc)
+                
+                st.markdown("---")
+                st.markdown(f"**総合スコア: {signal_row['total_score']:+.2f}**")
+        else:
+            st.error("データの取得に失敗しました")
+    
+    st.divider()
     
     # ==================== 詳細テーブル ====================
     st.subheader("📋 詳細データ")
