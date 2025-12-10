@@ -119,12 +119,30 @@ class DatabaseManager:
             )
         """)
         
+        # シグナルキャッシュテーブル
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS signal_cache (
+                ticker TEXT PRIMARY KEY,
+                price REAL,
+                change REAL,
+                rsi REAL,
+                rsi_signal REAL,
+                ma_signal REAL,
+                macd_signal REAL,
+                bb_signal REAL,
+                vol_signal REAL,
+                total_score REAL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # インデックス作成
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_ticker ON price_cache(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_date ON price_cache(date)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_prediction_ticker ON prediction_history(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_ticker ON portfolio(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ticker ON alerts(ticker)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_signal_cache_score ON signal_cache(total_score)")
         
         conn.commit()
         conn.close()
@@ -723,6 +741,119 @@ class DatabaseManager:
         rows = cursor.fetchall()
         conn.close()
         return {row['ticker']: dict(row) for row in rows}
+    
+    # ==================== シグナルキャッシュ操作 ====================
+    
+    def save_signal_cache(self, ticker: str, signal_data: Dict) -> bool:
+        """シグナルデータをキャッシュに保存"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT OR REPLACE INTO signal_cache 
+                (ticker, price, change, rsi, rsi_signal, ma_signal, macd_signal, 
+                 bb_signal, vol_signal, total_score, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                ticker.upper(),
+                signal_data.get('price'),
+                signal_data.get('change'),
+                signal_data.get('rsi'),
+                signal_data.get('rsi_signal'),
+                signal_data.get('ma_signal'),
+                signal_data.get('macd_signal'),
+                signal_data.get('bb_signal'),
+                signal_data.get('vol_signal'),
+                signal_data.get('total_score')
+            ))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Error saving signal cache: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def save_signals_batch(self, signals: Dict[str, Dict]) -> int:
+        """複数のシグナルデータを一括保存"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        saved = 0
+        try:
+            for ticker, signal_data in signals.items():
+                cursor.execute("""
+                    INSERT OR REPLACE INTO signal_cache 
+                    (ticker, price, change, rsi, rsi_signal, ma_signal, macd_signal, 
+                     bb_signal, vol_signal, total_score, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (
+                    ticker.upper(),
+                    signal_data.get('price'),
+                    signal_data.get('change'),
+                    signal_data.get('rsi'),
+                    signal_data.get('rsi_signal'),
+                    signal_data.get('ma_signal'),
+                    signal_data.get('macd_signal'),
+                    signal_data.get('bb_signal'),
+                    signal_data.get('vol_signal'),
+                    signal_data.get('total_score')
+                ))
+                saved += 1
+            conn.commit()
+            return saved
+        except Exception as e:
+            print(f"Error saving signals batch: {e}")
+            return saved
+        finally:
+            conn.close()
+    
+    def get_signal_cache(self, ticker: str = None, max_age_minutes: int = 30) -> List[Dict]:
+        """シグナルキャッシュを取得"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        if ticker:
+            cursor.execute("""
+                SELECT * FROM signal_cache 
+                WHERE ticker = ? 
+                AND datetime(updated_at) > datetime('now', ? || ' minutes')
+            """, (ticker.upper(), f'-{max_age_minutes}'))
+        else:
+            cursor.execute("""
+                SELECT s.*, w.name as ticker_name, w.market
+                FROM signal_cache s
+                LEFT JOIN watchlist w ON s.ticker = w.ticker
+                WHERE datetime(s.updated_at) > datetime('now', ? || ' minutes')
+                ORDER BY s.total_score DESC
+            """, (f'-{max_age_minutes}',))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def get_signal_cache_all(self) -> List[Dict]:
+        """全てのシグナルキャッシュを取得（有効期限なし）"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.*, w.name as ticker_name, w.market
+            FROM signal_cache s
+            LEFT JOIN watchlist w ON s.ticker = w.ticker
+            ORDER BY s.total_score DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def clear_signal_cache(self) -> int:
+        """シグナルキャッシュをクリア"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM signal_cache")
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return deleted
 
 
 # シングルトンインスタンス
