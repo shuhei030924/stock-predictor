@@ -353,17 +353,20 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     # ==================== サマリー ====================
     st.subheader("📊 シグナルサマリー")
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
-    strong_buy = len(df_signals[df_signals['total_score'] > 0.5])
-    buy = len(df_signals[(df_signals['total_score'] > 0) & (df_signals['total_score'] <= 0.5)])
-    sell = len(df_signals[(df_signals['total_score'] < 0) & (df_signals['total_score'] >= -0.5)])
-    strong_sell = len(df_signals[df_signals['total_score'] < -0.5])
+    # 新しい閾値: ±0.2未満は中立
+    strong_buy = len(df_signals[df_signals['total_score'] >= 0.5])
+    buy = len(df_signals[(df_signals['total_score'] >= 0.2) & (df_signals['total_score'] < 0.5)])
+    neutral = len(df_signals[(df_signals['total_score'] > -0.2) & (df_signals['total_score'] < 0.2)])
+    sell = len(df_signals[(df_signals['total_score'] <= -0.2) & (df_signals['total_score'] > -0.5)])
+    strong_sell = len(df_signals[df_signals['total_score'] <= -0.5])
     
-    col1.metric("🟢 強い買い", strong_buy)
-    col2.metric("🔵 買い", buy)
-    col3.metric("🟠 売り", sell)
-    col4.metric("🔴 強い売り", strong_sell)
+    col1.metric("🟢 強い買い", strong_buy, help="スコア ≥ 0.5")
+    col2.metric("🔵 買い", buy, help="スコア 0.2～0.5")
+    col3.metric("⚪ 中立", neutral, help="スコア -0.2～0.2")
+    col4.metric("🟠 売り", sell, help="スコア -0.5～-0.2")
+    col5.metric("🔴 強い売り", strong_sell, help="スコア ≤ -0.5")
     
     st.divider()
     
@@ -579,6 +582,163 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
 else:
     st.info("👆 「シグナル更新」ボタンを押してデータを取得してください")
 
+# ==================== バックテストセクション ====================
+st.divider()
+st.subheader("🧪 シグナルバックテスト")
+st.caption("シグナルに基づいて仮想売買をシミュレーション（初期資金: 100万円）")
+
+# バックテスト残高取得
+bt_balance = db.backtest_get_balance()
+bt_portfolio = db.backtest_get_portfolio()
+
+# 残高表示
+col1, col2, col3, col4 = st.columns(4)
+
+# 保有株の時価を計算（現在のシグナルデータから価格取得）
+stock_value = 0
+if 'signal_data' in st.session_state and bt_portfolio:
+    signal_data = st.session_state['signal_data']
+    for pos in bt_portfolio:
+        if pos['ticker'] in signal_data:
+            price = signal_data[pos['ticker']]['price']
+            stock_value += pos['shares'] * price
+        else:
+            stock_value += pos['shares'] * pos['current_price']
+
+total_value = bt_balance['cash'] + stock_value
+initial_value = 1000000
+profit_rate = ((total_value - initial_value) / initial_value) * 100
+
+col1.metric("💵 現金", f"¥{bt_balance['cash']:,.0f}")
+col2.metric("📈 株式評価額", f"¥{stock_value:,.0f}")
+col3.metric("💰 総資産", f"¥{total_value:,.0f}")
+col4.metric("📊 損益率", f"{profit_rate:+.2f}%", delta=f"¥{total_value - initial_value:+,.0f}")
+
+# バックテスト実行ボタン
+st.markdown("### 🎯 テスト実行")
+col1, col2, col3 = st.columns([2, 2, 1])
+
+with col1:
+    if st.button("▶️ シグナルに基づいて売買実行", type="primary", use_container_width=True):
+        if 'signal_data' not in st.session_state:
+            st.error("先にシグナルを更新してください")
+        else:
+            signal_data = st.session_state['signal_data']
+            executed_trades = []
+            
+            for ticker, data in signal_data.items():
+                score = data['total_score']
+                price = data['price']
+                
+                if score >= 0.5:
+                    # 強い買い: 10万円分購入
+                    if db.backtest_buy(ticker, 100000, price, score, "強い買いシグナル"):
+                        executed_trades.append(f"🟢 {ticker}: ¥100,000 購入")
+                elif score >= 0.2:
+                    # 買い: 5万円分購入
+                    if db.backtest_buy(ticker, 50000, price, score, "買いシグナル"):
+                        executed_trades.append(f"🔵 {ticker}: ¥50,000 購入")
+                elif score <= -0.5:
+                    # 強い売り: 全額売却
+                    if db.backtest_sell(ticker, 1.0, price, score, "強い売りシグナル"):
+                        executed_trades.append(f"🔴 {ticker}: 全株売却")
+                elif score <= -0.2:
+                    # 売り: 半分売却
+                    if db.backtest_sell(ticker, 0.5, price, score, "売りシグナル"):
+                        executed_trades.append(f"🟠 {ticker}: 半分売却")
+            
+            if executed_trades:
+                st.success(f"✅ {len(executed_trades)}件の取引を実行しました")
+                for trade in executed_trades[:10]:  # 最大10件表示
+                    st.write(trade)
+                if len(executed_trades) > 10:
+                    st.caption(f"他 {len(executed_trades) - 10}件...")
+                st.rerun()
+            else:
+                st.info("売買対象の銘柄がありませんでした（中立シグナルのみ）")
+
+with col2:
+    if st.button("🔄 価格更新のみ", use_container_width=True, help="売買せず保有株の価格だけ更新"):
+        if 'signal_data' in st.session_state:
+            signal_data = st.session_state['signal_data']
+            price_map = {t: d['price'] for t, d in signal_data.items()}
+            db.backtest_update_prices(price_map)
+            st.success("価格を更新しました")
+            st.rerun()
+
+with col3:
+    if st.button("🗑️ リセット", use_container_width=True):
+        if db.backtest_reset(1000000):
+            st.success("バックテストをリセットしました（初期資金: 100万円）")
+            st.rerun()
+
+# 保有ポートフォリオ表示
+if bt_portfolio:
+    st.markdown("### 📦 保有ポートフォリオ")
+    portfolio_data = []
+    for pos in bt_portfolio:
+        current_price = pos['current_price']
+        if 'signal_data' in st.session_state and pos['ticker'] in st.session_state['signal_data']:
+            current_price = st.session_state['signal_data'][pos['ticker']]['price']
+        
+        value = pos['shares'] * current_price
+        cost = pos['shares'] * pos['avg_cost']
+        pnl = value - cost
+        pnl_rate = (pnl / cost) * 100 if cost > 0 else 0
+        
+        portfolio_data.append({
+            '銘柄': pos['ticker'],
+            '株数': f"{pos['shares']:.2f}",
+            '平均取得単価': f"${pos['avg_cost']:.2f}",
+            '現在価格': f"${current_price:.2f}",
+            '評価額': f"¥{value:,.0f}",
+            '損益': f"¥{pnl:+,.0f}",
+            '損益率': f"{pnl_rate:+.1f}%"
+        })
+    
+    st.dataframe(pd.DataFrame(portfolio_data), use_container_width=True, hide_index=True)
+
+# 取引履歴表示
+with st.expander("📜 取引履歴"):
+    transactions = db.backtest_get_transactions(20)
+    if transactions:
+        tx_data = []
+        for tx in transactions:
+            tx_data.append({
+                '日時': tx['created_at'][:16],
+                '銘柄': tx['ticker'],
+                '売買': '🟢 買い' if tx['action'] == 'BUY' else '🔴 売り',
+                '株数': f"{tx['shares']:.2f}",
+                '価格': f"${tx['price']:.2f}",
+                '金額': f"¥{tx['amount']:,.0f}",
+                'スコア': f"{tx['signal_score']:+.2f}" if tx['signal_score'] else "-",
+                '理由': tx['reason'] or ""
+            })
+        st.dataframe(pd.DataFrame(tx_data), use_container_width=True, hide_index=True)
+    else:
+        st.info("取引履歴がありません")
+
+# 資産推移グラフ
+with st.expander("📈 資産推移"):
+    balance_history = db.backtest_get_balance_history()
+    if len(balance_history) > 1:
+        import plotly.graph_objects as go
+        
+        dates = [b['created_at'] for b in balance_history]
+        totals = [b['total_value'] for b in balance_history]
+        cashes = [b['cash'] for b in balance_history]
+        stocks = [b['stock_value'] for b in balance_history]
+        
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=dates, y=totals, name='総資産', line=dict(color='blue', width=2)))
+        fig.add_trace(go.Scatter(x=dates, y=cashes, name='現金', line=dict(color='green', width=1)))
+        fig.add_trace(go.Scatter(x=dates, y=stocks, name='株式', line=dict(color='orange', width=1)))
+        fig.add_hline(y=1000000, line_dash="dash", line_color="gray", annotation_text="初期資金")
+        fig.update_layout(title="資産推移", height=300, hovermode='x unified')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("まだ取引がありません")
+
 # 自動更新
 if auto_refresh and 'last_update' in st.session_state:
     import time
@@ -593,6 +753,15 @@ with st.expander("📖 指標の説明"):
     - **0.0**: 中立
     - **-1.0**: 強い売りシグナル
     
+    ### 判定閾値
+    | スコア | 判定 | バックテスト動作 |
+    |--------|------|-----------------|
+    | ≥ 0.5 | 🟢 強い買い | 10万円購入 |
+    | 0.2～0.5 | 🔵 買い | 5万円購入 |
+    | -0.2～0.2 | ⚪ 中立 | 何もしない |
+    | -0.5～-0.2 | 🟠 売り | 半分売却 |
+    | ≤ -0.5 | 🔴 強い売り | 全株売却 |
+    
     ### 各指標
     | 指標 | 説明 | 買いシグナル | 売りシグナル |
     |-----|------|-------------|-------------|
@@ -605,7 +774,7 @@ with st.expander("📖 指標の説明"):
     ### 総合スコアの重み
     - RSI: 20%
     - MA: 25%
-    - MACD: 25%
+    - **MACD: 30%** （最重要）
     - BB: 15%
-    - 出来高: 15%
+    - 出来高: 10%
     """)

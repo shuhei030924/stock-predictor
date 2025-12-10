@@ -136,6 +136,45 @@ class DatabaseManager:
             )
         """)
         
+        # バックテスト用テーブル
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_portfolio (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                shares REAL NOT NULL,
+                avg_cost REAL NOT NULL,
+                current_price REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # バックテスト取引履歴
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                action TEXT NOT NULL,
+                shares REAL NOT NULL,
+                price REAL NOT NULL,
+                amount REAL NOT NULL,
+                signal_score REAL,
+                reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # バックテスト資産推移
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_balance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cash REAL NOT NULL,
+                stock_value REAL NOT NULL,
+                total_value REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # インデックス作成
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_ticker ON price_cache(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_date ON price_cache(date)")
@@ -854,6 +893,229 @@ class DatabaseManager:
         conn.commit()
         conn.close()
         return deleted
+
+    # ==================== バックテスト操作 ====================
+    
+    def backtest_get_balance(self) -> Dict:
+        """バックテストの現在残高を取得"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        # 最新の残高を取得
+        cursor.execute("""
+            SELECT * FROM backtest_balance ORDER BY id DESC LIMIT 1
+        """)
+        row = cursor.fetchone()
+        
+        if row:
+            result = dict(row)
+        else:
+            # 初期値: 100万円
+            result = {'cash': 1000000, 'stock_value': 0, 'total_value': 1000000}
+        
+        conn.close()
+        return result
+    
+    def backtest_get_portfolio(self) -> List[Dict]:
+        """バックテストのポートフォリオを取得"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM backtest_portfolio WHERE shares > 0
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def backtest_get_transactions(self, limit: int = 50) -> List[Dict]:
+        """バックテストの取引履歴を取得"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM backtest_transactions 
+            ORDER BY created_at DESC LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def backtest_get_balance_history(self) -> List[Dict]:
+        """バックテストの資産推移を取得"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM backtest_balance ORDER BY created_at
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+    
+    def backtest_buy(self, ticker: str, amount: float, price: float, signal_score: float, reason: str) -> bool:
+        """バックテスト: 買い注文"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # 現在の残高取得
+            balance = self.backtest_get_balance()
+            cash = balance['cash']
+            
+            # 資金チェック
+            if cash < amount:
+                amount = cash  # 残高分だけ買う
+            
+            if amount <= 0:
+                return False
+            
+            shares = amount / price
+            
+            # 既存ポジションをチェック
+            cursor.execute("SELECT * FROM backtest_portfolio WHERE ticker = ?", (ticker,))
+            existing = cursor.fetchone()
+            
+            if existing:
+                # 平均取得単価を更新
+                old_shares = existing['shares']
+                old_cost = existing['avg_cost']
+                new_shares = old_shares + shares
+                new_avg_cost = ((old_shares * old_cost) + (shares * price)) / new_shares
+                
+                cursor.execute("""
+                    UPDATE backtest_portfolio 
+                    SET shares = ?, avg_cost = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE ticker = ?
+                """, (new_shares, new_avg_cost, price, ticker))
+            else:
+                cursor.execute("""
+                    INSERT INTO backtest_portfolio (ticker, shares, avg_cost, current_price)
+                    VALUES (?, ?, ?, ?)
+                """, (ticker, shares, price, price))
+            
+            # 取引履歴に追加
+            cursor.execute("""
+                INSERT INTO backtest_transactions (ticker, action, shares, price, amount, signal_score, reason)
+                VALUES (?, 'BUY', ?, ?, ?, ?, ?)
+            """, (ticker, shares, price, amount, signal_score, reason))
+            
+            # 残高更新
+            new_cash = cash - amount
+            stock_value = self._calc_stock_value(cursor, price_map={ticker: price})
+            total_value = new_cash + stock_value
+            
+            cursor.execute("""
+                INSERT INTO backtest_balance (cash, stock_value, total_value)
+                VALUES (?, ?, ?)
+            """, (new_cash, stock_value, total_value))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Backtest buy error: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def backtest_sell(self, ticker: str, sell_ratio: float, price: float, signal_score: float, reason: str) -> bool:
+        """バックテスト: 売り注文 (sell_ratio: 0.5=半分, 1.0=全部)"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # 既存ポジションをチェック
+            cursor.execute("SELECT * FROM backtest_portfolio WHERE ticker = ?", (ticker,))
+            existing = cursor.fetchone()
+            
+            if not existing or existing['shares'] <= 0:
+                return False
+            
+            shares_to_sell = existing['shares'] * sell_ratio
+            amount = shares_to_sell * price
+            remaining_shares = existing['shares'] - shares_to_sell
+            
+            if remaining_shares < 0.0001:
+                # 全売却
+                cursor.execute("DELETE FROM backtest_portfolio WHERE ticker = ?", (ticker,))
+            else:
+                cursor.execute("""
+                    UPDATE backtest_portfolio 
+                    SET shares = ?, current_price = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE ticker = ?
+                """, (remaining_shares, price, ticker))
+            
+            # 取引履歴に追加
+            cursor.execute("""
+                INSERT INTO backtest_transactions (ticker, action, shares, price, amount, signal_score, reason)
+                VALUES (?, 'SELL', ?, ?, ?, ?, ?)
+            """, (ticker, shares_to_sell, price, amount, signal_score, reason))
+            
+            # 残高更新
+            balance = self.backtest_get_balance()
+            new_cash = balance['cash'] + amount
+            stock_value = self._calc_stock_value(cursor, price_map={ticker: price})
+            total_value = new_cash + stock_value
+            
+            cursor.execute("""
+                INSERT INTO backtest_balance (cash, stock_value, total_value)
+                VALUES (?, ?, ?)
+            """, (new_cash, stock_value, total_value))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Backtest sell error: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def _calc_stock_value(self, cursor, price_map: Dict[str, float] = None) -> float:
+        """保有株の時価総額を計算"""
+        cursor.execute("SELECT ticker, shares, current_price FROM backtest_portfolio WHERE shares > 0")
+        rows = cursor.fetchall()
+        
+        total = 0
+        for row in rows:
+            price = price_map.get(row['ticker'], row['current_price']) if price_map else row['current_price']
+            total += row['shares'] * price
+        
+        return total
+    
+    def backtest_update_prices(self, price_map: Dict[str, float]) -> None:
+        """バックテスト: ポートフォリオの現在価格を更新"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        for ticker, price in price_map.items():
+            cursor.execute("""
+                UPDATE backtest_portfolio SET current_price = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE ticker = ?
+            """, (price, ticker))
+        
+        conn.commit()
+        conn.close()
+    
+    def backtest_reset(self, initial_cash: float = 1000000) -> bool:
+        """バックテストをリセット"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("DELETE FROM backtest_portfolio")
+            cursor.execute("DELETE FROM backtest_transactions")
+            cursor.execute("DELETE FROM backtest_balance")
+            
+            # 初期残高を設定
+            cursor.execute("""
+                INSERT INTO backtest_balance (cash, stock_value, total_value)
+                VALUES (?, 0, ?)
+            """, (initial_cash, initial_cash))
+            
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Backtest reset error: {e}")
+            return False
+        finally:
+            conn.close()
 
 
 # シングルトンインスタンス
