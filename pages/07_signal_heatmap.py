@@ -544,46 +544,7 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         st.session_state['modal_ticker'] = clicked_ticker
         st.session_state['modal_ticker_idx'] = selected_row_idx
     
-    # ==================== 銘柄選択用データ ====================
-    ticker_list = df_signals['ticker'].tolist()
-    ticker_names_map = {t: ticker_names.get(t, '') for t in ticker_list}
-        
     st.divider()
-    
-    # ==================== 詳細テーブル ====================
-    st.subheader("📋 詳細データ（銘柄をクリックで詳細表示）")
-    
-    # data_sourceがない場合の対応
-    if 'data_source' not in df_signals.columns:
-        df_signals['data_source'] = 'Cache'
-    
-    # 表示用データフレーム
-    display_df = df_signals[['ticker', 'name', 'price', 'change', 'rsi', 'total_score']].copy()
-    display_df.columns = ['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア']
-    
-    # スコアに応じた判定
-    def get_signal_label(score):
-        if score > 0.5:
-            return '🟢 強い買い'
-        elif score > 0:
-            return '🔵 買い'
-        elif score > -0.5:
-            return '🟠 売り'
-        else:
-            return '🔴 強い売り'
-    
-    display_df['判定'] = df_signals['total_score'].apply(get_signal_label)
-    display_df['現在値'] = display_df['現在値'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "-")
-    display_df['変動率%'] = display_df['変動率%'].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-")
-    display_df['RSI'] = display_df['RSI'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
-    display_df['総合スコア'] = display_df['総合スコア'].apply(lambda x: f"{x:+.2f}")
-    
-    # テーブル表示（選択なし - ヒートマップで選択）
-    st.dataframe(
-        display_df[['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア', '判定']],
-        use_container_width=True,
-        hide_index=True
-    )
     
     # ==================== トップ銘柄 ====================
     st.subheader("🏆⚠️ シグナルTOP5（クリックで詳細モーダル表示）")
