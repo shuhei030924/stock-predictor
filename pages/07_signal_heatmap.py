@@ -414,19 +414,36 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         yaxis=dict(tickmode='linear'),
     )
     
-    st.plotly_chart(fig, use_container_width=True)
+    # ヒートマップをクリック可能に
+    selected_points = st.plotly_chart(fig, use_container_width=True, on_select="rerun", key="heatmap")
+    
+    # ヒートマップでクリックされた銘柄を取得
+    if selected_points and selected_points.selection and selected_points.selection.points:
+        point = selected_points.selection.points[0]
+        if 'y' in point:
+            st.session_state['selected_ticker'] = point['y']
     
     # ==================== 銘柄詳細表示 ====================
     st.divider()
     st.subheader("🔍 銘柄詳細トレンド")
     
-    # 銘柄選択
+    # 銘柄選択（session_stateから初期値を取得）
     ticker_list = df_signals['ticker'].tolist()
     ticker_options = [f"{t} - {ticker_names.get(t, '')}" for t in ticker_list]
     
+    # 選択中の銘柄があれば、そのインデックスを取得
+    default_idx = 0
+    if 'selected_ticker' in st.session_state:
+        selected_t = st.session_state['selected_ticker']
+        for i, opt in enumerate(ticker_options):
+            if opt.startswith(selected_t + " "):
+                default_idx = i
+                break
+    
     selected_detail = st.selectbox(
-        "詳細を見る銘柄を選択", 
+        "詳細を見る銘柄を選択（ヒートマップ/テーブル/TOP5をクリックでも選択可能）", 
         options=ticker_options,
+        index=default_idx,
         key="detail_ticker"
     )
     
@@ -607,11 +624,15 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
     st.divider()
     
     # ==================== 詳細テーブル ====================
-    st.subheader("📋 詳細データ")
+    st.subheader("📋 詳細データ（銘柄をクリックで詳細表示）")
+    
+    # data_sourceがない場合の対応
+    if 'data_source' not in df_signals.columns:
+        df_signals['data_source'] = 'Cache'
     
     # 表示用データフレーム
-    display_df = df_signals[['ticker', 'name', 'price', 'change', 'rsi', 'total_score', 'data_source']].copy()
-    display_df.columns = ['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア', 'データ']
+    display_df = df_signals[['ticker', 'name', 'price', 'change', 'rsi', 'total_score']].copy()
+    display_df.columns = ['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア']
     
     # スコアに応じた判定
     def get_signal_label(score):
@@ -625,16 +646,25 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
             return '🔴 強い売り'
     
     display_df['判定'] = df_signals['total_score'].apply(get_signal_label)
-    display_df['現在値'] = display_df['現在値'].apply(lambda x: f"${x:.2f}")
-    display_df['変動率%'] = display_df['変動率%'].apply(lambda x: f"{x:+.2f}%")
-    display_df['RSI'] = display_df['RSI'].apply(lambda x: f"{x:.1f}")
+    display_df['現在値'] = display_df['現在値'].apply(lambda x: f"${x:.2f}" if pd.notna(x) else "-")
+    display_df['変動率%'] = display_df['変動率%'].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-")
+    display_df['RSI'] = display_df['RSI'].apply(lambda x: f"{x:.1f}" if pd.notna(x) else "-")
     display_df['総合スコア'] = display_df['総合スコア'].apply(lambda x: f"{x:+.2f}")
     
-    st.dataframe(
-        display_df[['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア', '判定', 'データ']],
+    # クリック可能なテーブル
+    event = st.dataframe(
+        display_df[['銘柄', '銘柄名', '現在値', '変動率%', 'RSI', '総合スコア', '判定']],
         use_container_width=True,
-        hide_index=True
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row"
     )
+    
+    # テーブルで選択された銘柄を詳細表示
+    if event.selection and event.selection.rows:
+        selected_row_idx = event.selection.rows[0]
+        clicked_ticker = df_signals.iloc[selected_row_idx]['ticker']
+        st.session_state['selected_ticker'] = clicked_ticker
     
     # ==================== トップ銘柄 ====================
     col1, col2 = st.columns(2)
@@ -644,16 +674,20 @@ if 'signal_data' in st.session_state and st.session_state['signal_data']:
         top_buy = df_signals.nlargest(5, 'total_score')[['ticker', 'name', 'total_score', 'change']]
         for _, row in top_buy.iterrows():
             score_bar = "🟩" * int((row['total_score'] + 1) * 2.5)
-            st.markdown(f"**{row['ticker']}** {row['name'] or ''}")
-            st.caption(f"{score_bar} スコア: {row['total_score']:+.2f} | 変動: {row['change']:+.2f}%")
+            if st.button(f"📈 {row['ticker']}", key=f"buy_{row['ticker']}"):
+                st.session_state['selected_ticker'] = row['ticker']
+                st.rerun()
+            st.caption(f"{row['name'] or ''} | {score_bar} スコア: {row['total_score']:+.2f}")
     
     with col2:
         st.subheader("⚠️ 売りシグナル TOP5")
         top_sell = df_signals.nsmallest(5, 'total_score')[['ticker', 'name', 'total_score', 'change']]
         for _, row in top_sell.iterrows():
             score_bar = "🟥" * int((1 - row['total_score']) * 2.5)
-            st.markdown(f"**{row['ticker']}** {row['name'] or ''}")
-            st.caption(f"{score_bar} スコア: {row['total_score']:+.2f} | 変動: {row['change']:+.2f}%")
+            if st.button(f"📉 {row['ticker']}", key=f"sell_{row['ticker']}"):
+                st.session_state['selected_ticker'] = row['ticker']
+                st.rerun()
+            st.caption(f"{row['name'] or ''} | {score_bar} スコア: {row['total_score']:+.2f}")
 
 else:
     st.info("👆 「シグナル更新」ボタンを押してデータを取得してください")
