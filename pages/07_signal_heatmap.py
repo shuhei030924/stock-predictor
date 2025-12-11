@@ -584,35 +584,75 @@ else:
 
 # ==================== バックテストセクション ====================
 st.divider()
-st.subheader("🧪 シグナルバックテスト")
-st.caption("シグナルに基づいて仮想売買をシミュレーション（初期資金: 100万円）")
+st.subheader("🧪 シグナルバックテスト（リスク管理型）")
+
+# アルゴリズム説明
+with st.expander("📋 売買アルゴリズム（案C: リスク管理型）"):
+    st.markdown("""
+    ### 資金管理ルール
+    - **現金比率**: 常に20%以上キープ
+    - **1銘柄上限**: 総資産の10%まで
+    - **最大保有銘柄数**: 10銘柄
+    
+    ### 買いルール
+    | スコア | 条件 | 購入額 |
+    |--------|------|--------|
+    | ≥ 0.5 (強い買い) | 未保有のみ | 総資産の8% |
+    | ≥ 0.2 (買い) | 未保有のみ | 総資産の5% |
+    | < 0.2 | - | 購入しない |
+    
+    ### 売りルール
+    | 条件 | アクション |
+    |------|-----------|
+    | スコア ≤ -0.5 | 全株売却 |
+    | スコア ≤ -0.2 | 半分売却 |
+    | **利確**: +20%到達 | 半分売却 |
+    | **損切**: -10%到達 | 全株売却 |
+    """)
 
 # バックテスト残高取得
 bt_balance = db.backtest_get_balance()
 bt_portfolio = db.backtest_get_portfolio()
 
-# 残高表示
-col1, col2, col3, col4 = st.columns(4)
-
 # 保有株の時価を計算（現在のシグナルデータから価格取得）
 stock_value = 0
-if 'signal_data' in st.session_state and bt_portfolio:
-    signal_data = st.session_state['signal_data']
+portfolio_with_pnl = []  # 損益計算済みポートフォリオ
+
+if bt_portfolio:
+    signal_data = st.session_state.get('signal_data', {})
     for pos in bt_portfolio:
         if pos['ticker'] in signal_data:
             price = signal_data[pos['ticker']]['price']
-            stock_value += pos['shares'] * price
         else:
-            stock_value += pos['shares'] * pos['current_price']
+            price = pos['current_price']
+        
+        value = pos['shares'] * price
+        cost = pos['shares'] * pos['avg_cost']
+        pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100 if pos['avg_cost'] > 0 else 0
+        
+        stock_value += value
+        portfolio_with_pnl.append({
+            'ticker': pos['ticker'],
+            'shares': pos['shares'],
+            'avg_cost': pos['avg_cost'],
+            'current_price': price,
+            'value': value,
+            'pnl_rate': pnl_rate
+        })
 
 total_value = bt_balance['cash'] + stock_value
 initial_value = 1000000
 profit_rate = ((total_value - initial_value) / initial_value) * 100
+cash_ratio = (bt_balance['cash'] / total_value) * 100 if total_value > 0 else 100
+held_tickers = set(p['ticker'] for p in bt_portfolio)
 
+# 残高表示
+col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("💵 現金", f"¥{bt_balance['cash']:,.0f}")
 col2.metric("📈 株式評価額", f"¥{stock_value:,.0f}")
 col3.metric("💰 総資産", f"¥{total_value:,.0f}")
 col4.metric("📊 損益率", f"{profit_rate:+.2f}%", delta=f"¥{total_value - initial_value:+,.0f}")
+col5.metric("💵 現金比率", f"{cash_ratio:.1f}%", delta="OK" if cash_ratio >= 20 else "⚠️低い")
 
 # バックテスト実行ボタン
 st.markdown("### 🎯 テスト実行")
@@ -626,36 +666,92 @@ with col1:
             signal_data = st.session_state['signal_data']
             executed_trades = []
             
-            for ticker, data in signal_data.items():
+            # === 売り処理を先に実行（現金確保）===
+            for pos in portfolio_with_pnl:
+                ticker = pos['ticker']
+                price = pos['current_price']
+                pnl_rate = pos['pnl_rate']
+                score = signal_data.get(ticker, {}).get('total_score', 0)
+                
+                # 損切り: -10%以下
+                if pnl_rate <= -10:
+                    if db.backtest_sell(ticker, 1.0, price, score, f"損切り ({pnl_rate:.1f}%)"):
+                        executed_trades.append(f"🔴 {ticker}: 全株売却（損切り {pnl_rate:.1f}%）")
+                    continue
+                
+                # 利確: +20%以上
+                if pnl_rate >= 20:
+                    if db.backtest_sell(ticker, 0.5, price, score, f"利確 ({pnl_rate:.1f}%)"):
+                        executed_trades.append(f"🟡 {ticker}: 半分売却（利確 {pnl_rate:.1f}%）")
+                    continue
+                
+                # 強い売りシグナル
+                if score <= -0.5:
+                    if db.backtest_sell(ticker, 1.0, price, score, "強い売りシグナル"):
+                        executed_trades.append(f"🔴 {ticker}: 全株売却（スコア {score:.2f}）")
+                # 売りシグナル
+                elif score <= -0.2:
+                    if db.backtest_sell(ticker, 0.5, price, score, "売りシグナル"):
+                        executed_trades.append(f"🟠 {ticker}: 半分売却（スコア {score:.2f}）")
+            
+            # 残高再取得
+            bt_balance = db.backtest_get_balance()
+            bt_portfolio = db.backtest_get_portfolio()
+            held_tickers = set(p['ticker'] for p in bt_portfolio)
+            total_value = bt_balance['cash'] + stock_value
+            
+            # === 買い処理 ===
+            # スコア順にソート
+            buy_candidates = [
+                (t, d) for t, d in signal_data.items() 
+                if d['total_score'] >= 0.2 and t not in held_tickers
+            ]
+            buy_candidates.sort(key=lambda x: x[1]['total_score'], reverse=True)
+            
+            for ticker, data in buy_candidates:
                 score = data['total_score']
                 price = data['price']
                 
+                # 現金比率チェック（20%以上キープ）
+                current_cash = db.backtest_get_balance()['cash']
+                if current_cash < total_value * 0.20:
+                    break
+                
+                # 保有銘柄数チェック（最大10銘柄）
+                current_portfolio = db.backtest_get_portfolio()
+                if len(current_portfolio) >= 10:
+                    break
+                
+                # 購入額決定
                 if score >= 0.5:
-                    # 強い買い: 10万円分購入
-                    if db.backtest_buy(ticker, 100000, price, score, "強い買いシグナル"):
-                        executed_trades.append(f"🟢 {ticker}: ¥100,000 購入")
-                elif score >= 0.2:
-                    # 買い: 5万円分購入
-                    if db.backtest_buy(ticker, 50000, price, score, "買いシグナル"):
-                        executed_trades.append(f"🔵 {ticker}: ¥50,000 購入")
-                elif score <= -0.5:
-                    # 強い売り: 全額売却
-                    if db.backtest_sell(ticker, 1.0, price, score, "強い売りシグナル"):
-                        executed_trades.append(f"🔴 {ticker}: 全株売却")
-                elif score <= -0.2:
-                    # 売り: 半分売却
-                    if db.backtest_sell(ticker, 0.5, price, score, "売りシグナル"):
-                        executed_trades.append(f"🟠 {ticker}: 半分売却")
+                    buy_amount = total_value * 0.08  # 総資産の8%
+                    reason = "強い買いシグナル"
+                else:
+                    buy_amount = total_value * 0.05  # 総資産の5%
+                    reason = "買いシグナル"
+                
+                # 1銘柄上限チェック（総資産の10%）
+                max_position = total_value * 0.10
+                buy_amount = min(buy_amount, max_position)
+                
+                # 現金残高チェック（20%キープ分を除く）
+                available_cash = current_cash - (total_value * 0.20)
+                buy_amount = min(buy_amount, available_cash)
+                
+                if buy_amount > 10000:  # 最低1万円以上
+                    if db.backtest_buy(ticker, buy_amount, price, score, reason):
+                        executed_trades.append(f"🟢 {ticker}: ¥{buy_amount:,.0f} 購入（スコア {score:.2f}）")
+                        held_tickers.add(ticker)
             
             if executed_trades:
                 st.success(f"✅ {len(executed_trades)}件の取引を実行しました")
-                for trade in executed_trades[:10]:  # 最大10件表示
+                for trade in executed_trades[:15]:
                     st.write(trade)
-                if len(executed_trades) > 10:
-                    st.caption(f"他 {len(executed_trades) - 10}件...")
+                if len(executed_trades) > 15:
+                    st.caption(f"他 {len(executed_trades) - 15}件...")
                 st.rerun()
             else:
-                st.info("売買対象の銘柄がありませんでした（中立シグナルのみ）")
+                st.info("売買対象の銘柄がありませんでした")
 
 with col2:
     if st.button("🔄 価格更新のみ", use_container_width=True, help="売買せず保有株の価格だけ更新"):
@@ -673,27 +769,34 @@ with col3:
             st.rerun()
 
 # 保有ポートフォリオ表示
-if bt_portfolio:
+if portfolio_with_pnl:
     st.markdown("### 📦 保有ポートフォリオ")
     portfolio_data = []
-    for pos in bt_portfolio:
-        current_price = pos['current_price']
-        if 'signal_data' in st.session_state and pos['ticker'] in st.session_state['signal_data']:
-            current_price = st.session_state['signal_data'][pos['ticker']]['price']
+    for pos in portfolio_with_pnl:
+        # シグナルスコア取得
+        score = st.session_state.get('signal_data', {}).get(pos['ticker'], {}).get('total_score', None)
+        score_str = f"{score:+.2f}" if score is not None else "-"
         
-        value = pos['shares'] * current_price
-        cost = pos['shares'] * pos['avg_cost']
-        pnl = value - cost
-        pnl_rate = (pnl / cost) * 100 if cost > 0 else 0
+        # 損益率による色分け表示
+        pnl_rate = pos['pnl_rate']
+        if pnl_rate >= 20:
+            status = "🟡 利確検討"
+        elif pnl_rate <= -10:
+            status = "🔴 損切り検討"
+        elif pnl_rate > 0:
+            status = "🟢 含み益"
+        else:
+            status = "🔵 含み損"
         
         portfolio_data.append({
             '銘柄': pos['ticker'],
             '株数': f"{pos['shares']:.2f}",
             '平均取得単価': f"${pos['avg_cost']:.2f}",
-            '現在価格': f"${current_price:.2f}",
-            '評価額': f"¥{value:,.0f}",
-            '損益': f"¥{pnl:+,.0f}",
-            '損益率': f"{pnl_rate:+.1f}%"
+            '現在価格': f"${pos['current_price']:.2f}",
+            '評価額': f"¥{pos['value']:,.0f}",
+            '損益率': f"{pnl_rate:+.1f}%",
+            'スコア': score_str,
+            '状態': status
         })
     
     st.dataframe(pd.DataFrame(portfolio_data), use_container_width=True, hide_index=True)
