@@ -507,11 +507,22 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         st.warning("市場データ(SPY)が取得できません。市場フィルターを無効化します。")
     
     # ========== v10.0: VIXデータ取得（レジーム検知用） ==========
-    vix_data = get_historical_data("^VIX", "3y")
-    if vix_data is None:
-        st.warning("VIXデータが取得できません。VIXフィルターを無効化します。")
-    else:
-        st.info("✅ VIXデータ取得成功 - 高度なレジーム検知を有効化")
+    # VIXは特殊なので、yfinanceから直接取得
+    import yfinance as yf
+    import requests
+    try:
+        session = requests.Session()
+        session.verify = False
+        vix_ticker = yf.Ticker("^VIX", session=session)
+        vix_data = vix_ticker.history(period="3y")
+        if vix_data is not None and len(vix_data) >= 50:
+            st.info(f"✅ VIXデータ取得成功（{len(vix_data)}日分） - 高度なレジーム検知を有効化")
+        else:
+            vix_data = None
+            st.warning("VIXデータが取得できません。VIXフィルターを無効化します。")
+    except Exception as e:
+        vix_data = None
+        st.warning(f"VIXデータ取得エラー: {e}。VIXフィルターを無効化します。")
     
     if not all_data:
         return {'error': f"データ不足の銘柄: {', '.join(failed_tickers)}", 'failed_tickers': failed_tickers}
