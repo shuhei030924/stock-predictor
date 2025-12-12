@@ -11,11 +11,13 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from database.db_manager import DatabaseManager
+from analysis.backtest_analyzer import analyze_backtest_results, print_analysis
 
 st.set_page_config(
     page_title="📅 過去1年バックテスト",
@@ -33,16 +35,17 @@ db = DatabaseManager()
 
 def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     """
-    特定の日付時点でのシグナルを計算
+    特定の日付時点でのシグナルを計算（改善版）
     target_idx: その日のインデックス（その日までのデータのみ使用）
     """
-    if target_idx < 50:  # 最低50日分のデータが必要
+    min_required = 50  # 最低50日必要
+    if target_idx < min_required:
         return None
     
     # その日までのデータのみ使用（未来のデータは見ない）
     df_slice = df.iloc[:target_idx + 1].copy()
     
-    if len(df_slice) < 50:
+    if len(df_slice) < min_required:
         return None
     
     # 最新価格（その日の終値）
@@ -50,15 +53,16 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     prev_price = float(df_slice['Close'].iloc[-2])
     price_change = ((current_price - prev_price) / prev_price) * 100
     
-    # RSI (14日)
+    # ========== RSI (14日) ==========
     delta = df_slice['Close'].diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     rsi_value = float(rsi.iloc[-1])
+    rsi_prev = float(rsi.iloc[-2])
     
-    # RSIシグナル
+    # RSIシグナル（基本）
     if rsi_value < 30:
         rsi_signal = 1.0
     elif rsi_value > 70:
@@ -66,10 +70,30 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     else:
         rsi_signal = (50 - rsi_value) / 50
     
-    # 移動平均
+    # ========== RSIダイバージェンス検出 ==========
+    # 価格が上昇しているのにRSIが下降 → 弱気ダイバージェンス（売りサイン）
+    # 価格が下降しているのにRSIが上昇 → 強気ダイバージェンス（買いサイン）
+    price_5d_change = (current_price - float(df_slice['Close'].iloc[-6])) / float(df_slice['Close'].iloc[-6]) * 100
+    rsi_5d_change = rsi_value - float(rsi.iloc[-6])
+    
+    divergence_signal = 0.0
+    if price_5d_change > 2 and rsi_5d_change < -5:  # 弱気ダイバージェンス
+        divergence_signal = -0.5
+    elif price_5d_change < -2 and rsi_5d_change > 5:  # 強気ダイバージェンス
+        divergence_signal = 0.5
+    
+    # ========== 移動平均 ==========
     sma5 = df_slice['Close'].rolling(window=5).mean()
     sma20 = df_slice['Close'].rolling(window=20).mean()
     sma50 = df_slice['Close'].rolling(window=50).mean()
+    
+    # 200日MAはデータが十分な場合のみ計算
+    has_sma200 = len(df_slice) >= 200
+    if has_sma200:
+        sma200 = df_slice['Close'].rolling(window=200).mean()
+        sma200_val = float(sma200.iloc[-1]) if not pd.isna(sma200.iloc[-1]) else sma50.iloc[-1]
+    else:
+        sma200_val = float(sma50.iloc[-1])  # 代わりに50日MAを使用
     
     sma5_val = float(sma5.iloc[-1])
     sma20_val = float(sma20.iloc[-1])
@@ -78,14 +102,21 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     # MAシグナル
     ma_signal = 0.0
     if current_price > sma5_val:
-        ma_signal += 0.3
+        ma_signal += 0.2
     if sma5_val > sma20_val:
-        ma_signal += 0.4
-    if sma20_val > sma50_val:
         ma_signal += 0.3
+    if sma20_val > sma50_val:
+        ma_signal += 0.25
+    if has_sma200 and sma50_val > sma200_val:  # ゴールデンクロス状態
+        ma_signal += 0.25
+    elif not has_sma200:
+        ma_signal += 0.125  # 200日MAがない場合は中立
     ma_signal = (ma_signal - 0.5) * 2
     
-    # MACD
+    # ========== トレンドフィルター（50日MA > 200日MA） ==========
+    is_uptrend = sma50_val > sma200_val if has_sma200 else True  # データ不足時はTrueとする
+    
+    # ========== MACD ==========
     ema12 = df_slice['Close'].ewm(span=12, adjust=False).mean()
     ema26 = df_slice['Close'].ewm(span=26, adjust=False).mean()
     macd_line = ema12 - ema26
@@ -95,6 +126,29 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     macd_val = float(macd_line.iloc[-1])
     macd_signal_val = float(signal_line.iloc[-1])
     macd_hist_val = float(macd_hist.iloc[-1])
+    macd_hist_prev = float(macd_hist.iloc[-2])
+    macd_hist_prev2 = float(macd_hist.iloc[-3])
+    
+    # MACDヒストグラムの傾き（モメンタム）
+    macd_momentum = macd_hist_val - macd_hist_prev
+    
+    # v8.5: MACDクロスオーバー検出
+    macd_crossover = 0
+    macd_prev = float(macd_line.iloc[-2])
+    macd_signal_prev = float(signal_line.iloc[-2])
+    # ゴールデンクロス: MACDがシグナルを上抜け
+    if macd_prev <= macd_signal_prev and macd_val > macd_signal_val:
+        macd_crossover = 1
+    # デッドクロス: MACDがシグナルを下抜け
+    elif macd_prev >= macd_signal_prev and macd_val < macd_signal_val:
+        macd_crossover = -1
+    
+    # v8.5: ヒストグラムの方向転換検出
+    hist_reversal = 0
+    if macd_hist_prev2 < macd_hist_prev and macd_hist_prev > macd_hist_val:
+        hist_reversal = -1  # ピーク形成（売りシグナル）
+    elif macd_hist_prev2 > macd_hist_prev and macd_hist_prev < macd_hist_val:
+        hist_reversal = 1   # 底形成（買いシグナル）
     
     if macd_val > macd_signal_val and macd_hist_val > 0:
         macd_signal = 1.0
@@ -103,7 +157,19 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     else:
         macd_signal = macd_hist_val / (abs(macd_hist_val) + 0.01) * 0.5
     
-    # ボリンジャーバンド
+    # MACDモメンタム補正
+    if macd_momentum > 0:
+        macd_signal = min(1.0, macd_signal + 0.2)
+    elif macd_momentum < 0:
+        macd_signal = max(-1.0, macd_signal - 0.2)
+    
+    # v8.5: クロスオーバーボーナス
+    if macd_crossover == 1:
+        macd_signal = min(1.0, macd_signal + 0.3)
+    elif macd_crossover == -1:
+        macd_signal = max(-1.0, macd_signal - 0.3)
+    
+    # ========== ボリンジャーバンド ==========
     bb_std = df_slice['Close'].rolling(window=20).std().iloc[-1]
     bb_upper = sma20_val + 2 * bb_std
     bb_lower = sma20_val - 2 * bb_std
@@ -111,84 +177,372 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     bb_position = (current_price - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
     bb_signal = (0.5 - bb_position) * 2
     
-    # 出来高
+    # ========== v8.1: 出来高プロファイル強化 ==========
     vol_sma = df_slice['Volume'].rolling(window=20).mean()
     vol_ratio = float(df_slice['Volume'].iloc[-1] / vol_sma.iloc[-1]) if vol_sma.iloc[-1] > 0 else 1.0
     
-    if vol_ratio > 1.5 and price_change > 0:
+    # 過去5日の出来高トレンドも確認
+    vol_5d_avg = float(df_slice['Volume'].iloc[-5:].mean())
+    vol_prev_5d_avg = float(df_slice['Volume'].iloc[-10:-5].mean())
+    vol_trend = (vol_5d_avg - vol_prev_5d_avg) / vol_prev_5d_avg if vol_prev_5d_avg > 0 else 0
+    
+    # 出来高急増 + 価格上昇 = 強い買いシグナル
+    if vol_ratio > 2.0 and price_change > 1:  # 出来高2倍以上&上昇
+        vol_signal = 1.5
+    elif vol_ratio > 1.5 and price_change > 0:
         vol_signal = 1.0
+    elif vol_ratio > 2.0 and price_change < -1:  # 出来高急増&下落=パニック売り
+        vol_signal = -1.5
     elif vol_ratio > 1.5 and price_change < 0:
         vol_signal = -1.0
     else:
         vol_signal = 0.0
     
-    # 総合スコア（案C: MACDを重視）
+    # 出来高トレンドボーナス（機関投資家の参入を検出）
+    vol_trend_bonus = min(0.3, max(-0.3, vol_trend * 0.5)) if vol_trend > 0.2 else 0
+    
+    # ========== ROC（Rate of Change）モメンタム ==========
+    roc_10 = (current_price - float(df_slice['Close'].iloc[-11])) / float(df_slice['Close'].iloc[-11]) * 100
+    if roc_10 > 5:
+        roc_signal = 0.5
+    elif roc_10 < -5:
+        roc_signal = -0.5
+    else:
+        roc_signal = roc_10 / 10
+    
+    # ========== ATR（Average True Range）==========
+    high = df_slice['High']
+    low = df_slice['Low']
+    close = df_slice['Close']
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = float(tr.rolling(window=14).mean().iloc[-1])
+    atr_pct = (atr / current_price) * 100  # ATRを価格比率で
+    
+    # ========== v8.2: ATRブレイクアウト検出 ==========
+    # ATRの縮小後の拡大を検出（ボラティリティブレイクアウト）
+    atr_5d = float(tr.rolling(window=5).mean().iloc[-1])
+    atr_20d = float(tr.rolling(window=20).mean().iloc[-1])
+    atr_ratio = atr_5d / atr_20d if atr_20d > 0 else 1.0
+    
+    # 直近の価格レンジを確認
+    recent_high = float(df_slice['High'].iloc[-5:].max())
+    recent_low = float(df_slice['Low'].iloc[-5:].min())
+    range_breakout = 0
+    
+    # 上方ブレイクアウト: 直近高値を更新 + ATR拡大
+    if current_price > recent_high * 0.998 and atr_ratio > 1.2:
+        range_breakout = 1
+    # 下方ブレイクアウト: 直近安値を更新 + ATR拡大
+    elif current_price < recent_low * 1.002 and atr_ratio > 1.2:
+        range_breakout = -1
+    
+    # ========== v8.4: マルチタイムフレームモメンタム ==========
+    # 複数期間のモメンタムを組み合わせ
+    momentum_5d = (current_price - float(df_slice['Close'].iloc[-6])) / float(df_slice['Close'].iloc[-6]) * 100
+    momentum_10d = (current_price - float(df_slice['Close'].iloc[-11])) / float(df_slice['Close'].iloc[-11]) * 100
+    momentum_20d = (current_price - float(df_slice['Close'].iloc[-21])) / float(df_slice['Close'].iloc[-21]) * 100
+    
+    # モメンタム一貫性: 全期間でプラスなら強いトレンド
+    momentum_consistency = 0
+    if momentum_5d > 0 and momentum_10d > 0 and momentum_20d > 0:
+        momentum_consistency = 1  # 強い上昇トレンド
+    elif momentum_5d < 0 and momentum_10d < 0 and momentum_20d < 0:
+        momentum_consistency = -1  # 強い下降トレンド
+    
+    # ========== v6: ボラティリティ調整済みリターン ==========
+    volatility_20d = float(df_slice['Close'].pct_change().rolling(20).std().iloc[-1]) * 100
+    risk_adjusted_momentum = momentum_20d / (volatility_20d + 0.1) if volatility_20d > 0 else momentum_20d
+    
+    # ========== v7新規: ケルトナーチャネル（Keltner Channel） ==========
+    # ATRベースの動的チャネル - ボラティリティ適応型
+    keltner_mid = float(df_slice['Close'].ewm(span=20, adjust=False).mean().iloc[-1])
+    keltner_upper = keltner_mid + 2.0 * atr
+    keltner_lower = keltner_mid - 2.0 * atr
+    keltner_position = (current_price - keltner_lower) / (keltner_upper - keltner_lower) if keltner_upper != keltner_lower else 0.5
+    
+    # ========== v7新規: ボラティリティスクイーズ検出（TTM Squeeze） ==========
+    # BBがケルトナー内に収まっている = スクイーズ状態 = ブレイクアウト待機
+    squeeze_on = (bb_lower > keltner_lower) and (bb_upper < keltner_upper)
+    # スクイーズ解除後のモメンタム方向を確認
+    squeeze_momentum = macd_hist_val  # MACDヒストグラムで方向判定
+    
+    # ========== v7新規: レジーム検出（市場状態分類） ==========
+    # 簡易版: ボラティリティ + トレンドで4状態に分類
+    vol_percentile_20 = volatility_20d
+    vol_median = float(df_slice['Close'].pct_change().rolling(60).std().iloc[-1]) * 100 if len(df_slice) >= 60 else vol_percentile_20
+    is_high_vol = vol_percentile_20 > vol_median * 1.2
+    
+    # レジーム: 0=低ボラ下降, 1=低ボラ上昇, 2=高ボラ下降, 3=高ボラ上昇
+    if is_uptrend:
+        regime = 3 if is_high_vol else 1  # 上昇トレンド
+    else:
+        regime = 2 if is_high_vol else 0  # 下降トレンド
+    
+    # レジーム別の推奨アクション
+    regime_names = ['低ボラ下降', '低ボラ上昇', '高ボラ下降', '高ボラ上昇']
+    regime_buy_mult = [0.0, 1.2, 0.3, 0.8]  # 各レジームでの買い倍率
+    regime_stop_mult = [1.0, 0.8, 1.5, 1.2]  # 各レジームでの損切り倍率
+
+    # ========== v9.2: 早期警戒シグナル（損失前の退出判定） ==========
+    early_warning_score = 0  # 0=問題なし, 1以上=警戒レベル
+    early_warning_reasons = []
+    
+    # 1. モメンタム悪化検知: 短期が長期を下回り始めた
+    if momentum_5d < 0 and momentum_10d > 0:  # 短期で反転開始
+        early_warning_score += 1
+        early_warning_reasons.append("短期モメンタム悪化")
+    if momentum_5d < momentum_10d < momentum_20d and momentum_5d < 0:  # 加速度的悪化
+        early_warning_score += 1
+        early_warning_reasons.append("モメンタム加速悪化")
+    
+    # 2. RSI反転検知: RSIが高値圏から下降開始
+    rsi_3d_ago = float(rsi.iloc[-4]) if len(rsi) >= 4 else rsi_prev
+    if rsi_value < rsi_prev < rsi_3d_ago and rsi_3d_ago > 60:  # 高値圏から連続下降
+        early_warning_score += 1
+        early_warning_reasons.append("RSI高値反転")
+    if rsi_value < 50 and rsi_prev > 50:  # RSI50割れ（中立ライン割れ）
+        early_warning_score += 1
+        early_warning_reasons.append("RSI50割れ")
+    
+    # 3. MACD悪化検知: ヒストグラムがピークから下降
+    if hist_reversal == -1:  # MACDヒストグラムがピーク形成
+        early_warning_score += 1
+        early_warning_reasons.append("MACDピーク反転")
+    if macd_crossover == -1:  # MACDデッドクロス
+        early_warning_score += 2  # 重要シグナル
+        early_warning_reasons.append("MACDデッドクロス")
+    
+    # 4. 出来高パニック売り検知: 出来高急増＋価格下落
+    if vol_ratio > 1.8 and price_change < -1:  # 出来高1.8倍以上で1%超下落
+        early_warning_score += 2
+        early_warning_reasons.append("出来高急増下落")
+    
+    # 5. SMA5がSMA20を下抜け（短期トレンド崩壊）
+    sma5_prev = float(sma5.iloc[-2])
+    sma20_prev = float(sma20.iloc[-2])
+    if sma5_prev >= sma20_prev and sma5_val < sma20_val:
+        early_warning_score += 1
+        early_warning_reasons.append("SMA5/20デッドクロス")
+    
+    # 6. ボリンジャーバンド上限からの反落
+    if bb_position < 0.7 and float((current_price - float(df_slice['Close'].iloc[-2])) / float(df_slice['Close'].iloc[-2]) * 100) < -1:
+        # 前日BB上部にいて、今日1%以上下落
+        prev_bb_position = (float(df_slice['Close'].iloc[-2]) - bb_lower) / (bb_upper - bb_lower) if bb_upper != bb_lower else 0.5
+        if prev_bb_position > 0.8:
+            early_warning_score += 1
+            early_warning_reasons.append("BB上限反落")
+
+    # ========== 総合スコア計算（改善版） ==========
     weights = {
-        'rsi': 0.20,
-        'ma': 0.25,
-        'macd': 0.30,
-        'bb': 0.15,
-        'volume': 0.10
+        'rsi': 0.15,
+        'divergence': 0.10,  # 新規追加
+        'ma': 0.20,
+        'macd': 0.25,
+        'bb': 0.10,
+        'volume': 0.10,
+        'roc': 0.10  # 新規追加
     }
     
     total_score = (
         rsi_signal * weights['rsi'] +
+        divergence_signal * weights['divergence'] +
         ma_signal * weights['ma'] +
         macd_signal * weights['macd'] +
         bb_signal * weights['bb'] +
-        vol_signal * weights['volume']
+        vol_signal * weights['volume'] +
+        roc_signal * weights['roc']
     )
+    
+    # v8.1: 出来高トレンドボーナスを追加
+    total_score += vol_trend_bonus
+    
+    # 下降トレンドでの買いシグナルをペナルティ
+    if not is_uptrend and total_score > 0:
+        total_score *= 0.5
+    
+    # ========== v7新規: スクイーズブレイクアウトボーナス ==========
+    # スクイーズ状態から解除されたタイミングで上方向ならボーナス
+    squeeze_bonus = 0.0
+    if squeeze_on and squeeze_momentum > 0:
+        squeeze_bonus = 0.15  # スクイーズ中で上向きモメンタム
+    
+    # ========== v7新規: レジーム調整後スコア ==========
+    regime_adjusted_score = total_score * regime_buy_mult[regime]
     
     return {
         'price': current_price,
         'change': price_change,
         'rsi': rsi_value,
-        'total_score': total_score
+        'total_score': total_score,
+        'is_uptrend': is_uptrend,
+        'atr_pct': atr_pct,
+        'bb_position': bb_position,
+        'high_price': float(df_slice['High'].iloc[-20:].max()),
+        'momentum_20d': momentum_20d,
+        'risk_adjusted_momentum': risk_adjusted_momentum,
+        'volatility': volatility_20d,
+        # v7新規
+        'regime': regime,
+        'regime_name': regime_names[regime],
+        'regime_buy_mult': regime_buy_mult[regime],
+        'regime_stop_mult': regime_stop_mult[regime],
+        'keltner_position': keltner_position,
+        'squeeze_on': squeeze_on,
+        'squeeze_bonus': squeeze_bonus,
+        'regime_adjusted_score': regime_adjusted_score,
+        # v9.2: 早期警戒シグナル
+        'early_warning_score': early_warning_score,
+        'early_warning_reasons': early_warning_reasons,
+        'rsi_prev': rsi_prev,
+        'macd_crossover': macd_crossover,
+        'hist_reversal': hist_reversal
     }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
 def get_historical_data(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """過去データを取得"""
+    """
+    過去データを取得（データベースキャッシュ優先）
+    """
+    # 期間を日数に変換
+    period_days = {
+        "3mo": 90, "6mo": 180, "1y": 365, "2y": 730, "3y": 1095, "5y": 1825, "max": 3650
+    }
+    days = period_days.get(period, 730)
+    
+    # まずデータベースから取得を試みる
+    df = db.get_cached_prices(ticker, days=days)
+    
+    if df is not None and len(df) >= 50:
+        return df
+    
+    # データベースにない場合はyfinanceから取得
     import ssl
-    ssl._create_default_https_context = ssl._create_unverified_context
+    import urllib3
+    import requests
+    import time
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except:
+        pass
+    
+    # レート制限対策: リクエスト間に遅延
+    time.sleep(0.5)
     
     try:
         import yfinance as yf
-        stock = yf.Ticker(ticker)
+        
+        # SSL検証を無効化したセッションを使用
+        session = requests.Session()
+        session.verify = False
+        
+        stock = yf.Ticker(ticker, session=session)
         df = stock.history(period=period)
-        if df is None or len(df) < 100:
-            return None
-        return df
+        
+        if df is not None and len(df) >= 50:
+            # データベースにキャッシュ
+            db.cache_prices(ticker, df)
+            return df
+            
+        return None
     except Exception as e:
-        print(f"Error fetching {ticker}: {e}")
+        if '429' in str(e) or 'Too Many Requests' in str(e):
+            st.warning(f"{ticker}: レート制限。DBキャッシュを確認中...")
         return None
 
 
 def run_backtest(tickers: list, initial_cash: float = 1000000, 
-                 start_days_ago: int = 252, progress_callback=None) -> dict:
+                 start_days_ago: int = 252, progress_callback=None,
+                 market_ticker: str = "SPY") -> dict:
     """
-    過去1年間のバックテストを実行
+    過去1年間のバックテストを実行（改善版v6 - 大胆な発想）
     
-    Parameters:
-    - tickers: 対象銘柄リスト
-    - initial_cash: 初期資金
-    - start_days_ago: 何日前から開始するか（252=約1年）
-    - progress_callback: 進捗コールバック関数
+    v7.0 改善点（最新研究 + 独自手法）:
     
-    Returns:
-    - バックテスト結果
+    【学術研究ベース】
+    - レジームスイッチング: 市場を4状態(低ボラ上昇/下降、高ボラ上昇/下降)に分類
+    - ケリー基準: 勝率と期待リターンから最適ポジションサイズを計算
+    - ボラティリティスクイーズ: TTM Squeezeでブレイクアウト検出
+    - アダプティブ損切り: レジームに応じた動的損切り
+    
+    【独自手法】
+    - セクター分散: 同一セクター集中を防ぐ
+    - 相関フィルター: 高相関銘柄の重複保有制限
+    - スクイーズブレイクアウト: 収縮後の拡大でエントリー
+    
+    【v6継続機能】
+    - 勝者追跡、敗者ブラックリスト、モメンタムランキング
     """
     
     # 各銘柄の過去データを取得
     all_data = {}
+    failed_tickers = []
+    required_days = start_days_ago + 200
+    
+    st.info(f"必要データ日数: {required_days}日")
+    
     for ticker in tickers:
-        df = get_historical_data(ticker, "2y")
-        if df is not None and len(df) > start_days_ago + 50:
-            all_data[ticker] = df
+        df = get_historical_data(ticker, "3y")
+        if df is not None:
+            if len(df) > required_days:
+                all_data[ticker] = df
+            elif len(df) > start_days_ago:
+                all_data[ticker] = df
+                st.warning(f"{ticker}: データが{len(df)}日のみ（一部指標が計算不可）")
+            else:
+                failed_tickers.append(f"{ticker}({len(df)}日)")
+        else:
+            failed_tickers.append(f"{ticker}(取得失敗)")
+    
+    if failed_tickers:
+        st.warning(f"データ不足銘柄: {', '.join(failed_tickers[:10])}")
+    
+    # 市場データ（SPY）を取得
+    market_data = get_historical_data(market_ticker, "3y")
+    if market_data is None:
+        st.warning("市場データ(SPY)が取得できません。市場フィルターを無効化します。")
     
     if not all_data:
-        return None
+        return {'error': f"データ不足の銘柄: {', '.join(failed_tickers)}", 'failed_tickers': failed_tickers}
+    
+    # ========== v7新規: セクター情報（簡易版） ==========
+    # 銘柄コードから簡易セクター推定（日本株は4桁コード）
+    def get_sector(ticker):
+        if '.T' in ticker:  # 日本株
+            code = ticker.replace('.T', '')
+            if code.startswith(('65', '66', '67', '68', '69')):
+                return 'tech'  # 電気機器、精密機器
+            elif code.startswith(('72', '73', '74', '75')):
+                return 'auto'  # 輸送用機器
+            elif code.startswith(('80', '81', '82', '83')):
+                return 'finance'  # 金融
+            elif code.startswith(('35', '36', '37', '38')):
+                return 'materials'  # 化学、鉄鋼
+            else:
+                return 'other'
+        else:  # 米国株
+            us_tech = ['AAPL', 'MSFT', 'GOOGL', 'GOOG', 'META', 'NVDA', 'AMD', 'TSLA', 'AMZN', 'CRM', 'ORCL', 'ADBE', 'INTC', 'QCOM', 'AVGO']
+            us_finance = ['JPM', 'BAC', 'GS', 'MS', 'C', 'WFC', 'V', 'MA', 'AXP', 'BRK-B']
+            us_health = ['JNJ', 'UNH', 'PFE', 'MRK', 'ABBV', 'LLY', 'BMY', 'TMO', 'ABT']
+            us_energy = ['XOM', 'CVX', 'COP', 'SLB', 'OXY']
+            
+            base = ticker.split('.')[0].upper()
+            if base in us_tech:
+                return 'tech'
+            elif base in us_finance:
+                return 'finance'
+            elif base in us_health:
+                return 'health'
+            elif base in us_energy:
+                return 'energy'
+            else:
+                return 'other'
+    
+    ticker_sectors = {t: get_sector(t) for t in all_data.keys()}
     
     # 共通の日付範囲を決定
     first_ticker = list(all_data.keys())[0]
@@ -196,9 +550,38 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
     
     # バックテスト状態
     cash = initial_cash
-    portfolio = {}  # {ticker: {'shares': float, 'avg_cost': float}}
-    history = []  # 日次の資産推移
-    trades = []  # 取引履歴
+    portfolio = {}  # {ticker: {'shares', 'avg_cost', 'high_since_buy', 'buy_date', 'days_held'}}
+    history = []
+    trades = []
+    
+    # シグナル履歴（2日連続確認用）
+    prev_day_signals = {}
+    
+    # ========== v6新規: 拡張トラッキング ==========
+    ticker_performance = {t: {
+        'wins': 0, 
+        'losses': 0, 
+        'total_pnl': 0.0, 
+        'trade_count': 0,
+        'big_wins': 0,  # +20%以上の大勝ち回数
+        'consecutive_losses': 0,  # 連敗数
+        'last_loss_day': 0,  # 最後に負けた日（ブラックリスト用）
+        'best_pnl': 0.0  # 最高利益率
+    } for t in all_data.keys()}
+    
+    # ========== v7新規: 市場レジーム履歴 ==========
+    market_regime_history = []  # レジーム変化の追跡
+    
+    # ========== v8.3: セクターパフォーマンス追跡 ==========
+    sector_performance = {
+        'tech': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+        'finance': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+        'auto': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+        'health': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+        'energy': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+        'materials': {'wins': 0, 'losses': 0, 'total_pnl': 0.0},
+        'other': {'wins': 0, 'losses': 0, 'total_pnl': 0.0}
+    }
     
     total_days = len(date_index)
     
@@ -206,16 +589,25 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         if progress_callback:
             progress_callback(day_num / total_days)
         
+        # ========== 市場トレンド判定 ==========
+        market_is_bullish = True
+        if market_data is not None:
+            market_mask = market_data.index <= current_date
+            if market_mask.sum() >= 200:
+                market_slice = market_data[market_mask]
+                market_sma200 = market_slice['Close'].rolling(200).mean().iloc[-1]
+                market_price = market_slice['Close'].iloc[-1]
+                market_is_bullish = market_price > market_sma200
+        
         # その日のシグナルを計算（各銘柄）
         daily_signals = {}
         daily_prices = {}
         
         for ticker, df in all_data.items():
-            # current_date以前のデータのみ使用
             mask = df.index <= current_date
             valid_idx = mask.sum() - 1
             
-            if valid_idx < 50:
+            if valid_idx < 50:  # 最低50日必要
                 continue
             
             signal = calculate_signal_at_date(df, valid_idx)
@@ -230,6 +622,61 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         )
         total_value = cash + stock_value
         
+        # ========== 保有日数更新 ==========
+        for ticker in portfolio:
+            portfolio[ticker]['days_held'] = portfolio[ticker].get('days_held', 0) + 1
+        
+        # ========== v9.0c: 弱気相場でのポジション縮小強化 ==========
+        # 市場がSMA200を下回ったら、ポジションを積極的に縮小
+        if not market_is_bullish and len(portfolio) > 0:
+            for ticker in list(portfolio.keys()):
+                if ticker not in daily_prices:
+                    continue
+                pos = portfolio[ticker]
+                price = daily_prices[ticker]
+                pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100
+                
+                sell_shares = 0
+                sell_reason = None
+                
+                # 利益が出ているポジションは全売却
+                if pnl_rate >= 5:  # +5%以上の利益
+                    sell_shares = pos['shares']
+                    sell_reason = f"弱気相場利確 ({pnl_rate:.1f}%)"
+                elif pnl_rate >= 1:  # +1%〜5%の利益
+                    sell_shares = pos['shares'] * 0.7  # 70%売却
+                    sell_reason = f"弱気相場縮小 ({pnl_rate:.1f}%)"
+                elif pnl_rate <= -3:  # -3%以下の損失は早めに損切り
+                    sell_shares = pos['shares']
+                    sell_reason = f"弱気相場損切り ({pnl_rate:.1f}%)"
+                
+                if sell_shares > 0:
+                    amount = sell_shares * price
+                    cash += amount
+                    
+                    trades.append({
+                        'date': current_date,
+                        'ticker': ticker,
+                        'action': 'SELL',
+                        'shares': sell_shares,
+                        'price': price,
+                        'amount': amount,
+                        'reason': sell_reason,
+                        'pnl_rate': pnl_rate
+                    })
+                    
+                    # パフォーマンス記録
+                    if pnl_rate > 0:
+                        ticker_performance[ticker]['wins'] += 1
+                    else:
+                        ticker_performance[ticker]['losses'] += 1
+                    ticker_performance[ticker]['total_pnl'] += pnl_rate
+                    ticker_performance[ticker]['trade_count'] += 1
+                    
+                    portfolio[ticker]['shares'] -= sell_shares
+                    if portfolio[ticker]['shares'] < 0.01:
+                        del portfolio[ticker]
+        
         # ========== 売り処理（先に実行） ==========
         for ticker in list(portfolio.keys()):
             if ticker not in daily_signals or ticker not in daily_prices:
@@ -238,32 +685,137 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             pos = portfolio[ticker]
             price = daily_prices[ticker]
             score = daily_signals[ticker]['total_score']
+            atr_pct = daily_signals[ticker].get('atr_pct', 2.0)
             pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100
+            days_held = pos.get('days_held', 0)
+            
+            # 高値更新
+            if price > pos.get('high_since_buy', pos['avg_cost']):
+                portfolio[ticker]['high_since_buy'] = price
+            
+            high_since_buy = pos.get('high_since_buy', pos['avg_cost'])
+            drop_from_high = ((high_since_buy - price) / high_since_buy) * 100 if high_since_buy > 0 else 0
             
             sell_reason = None
             sell_ratio = 0
             
-            # 損切り: -10%以下
-            if pnl_rate <= -10:
-                sell_reason = f"損切り ({pnl_rate:.1f}%)"
+            # ========== 改善v4: ポジションサイズの最低閾値 ==========
+            # 総資産の0.5%未満のポジションは全売却して整理
+            current_total = cash + sum(
+                portfolio[t]['shares'] * daily_prices.get(t, portfolio[t]['avg_cost'])
+                for t in portfolio
+            )
+            position_value = pos['shares'] * price
+            position_ratio = position_value / current_total if current_total > 0 else 0
+            
+            if position_ratio < 0.005:  # 0.5%未満は清算
+                sell_reason = f"ポジション整理 ({position_ratio*100:.2f}%)"
                 sell_ratio = 1.0
-            # 利確: +20%以上
-            elif pnl_rate >= 20:
-                sell_reason = f"利確 ({pnl_rate:.1f}%)"
-                sell_ratio = 0.5
+            
+            # ========== v9.0: 損切り厳格化 ==========
+            # 最大損失を-10%に制限し、損切りを早める
+            if sell_ratio == 0:
+                regime_stop_mult = daily_signals[ticker].get('regime_stop_mult', 1.0)
+                base_stop = min(8, atr_pct * 2.5)  # 基本損切りライン厳格化: 12→8, 3.5→2.5
+                
+                # レジーム調整: 高ボラ時は損切り幅を少し広げる（ただし上限あり）
+                adjusted_stop = min(10, base_stop * regime_stop_mult)  # 最大-10%
+                
+                # 保有期間ボーナス: 10日ごとに1%緩和（最大2%）- 緩和を抑制
+                holding_bonus = min(2, days_held // 10)
+                
+                # 過去好成績銘柄でも損切り緩和は控えめに
+                perf = ticker_performance[ticker]
+                if perf['trade_count'] >= 3 and perf['wins'] / perf['trade_count'] >= 0.7:
+                    holding_bonus += 1  # 勝率70%以上なら+1%のみ
+                
+                dynamic_stop = min(10, adjusted_stop + holding_bonus)  # 絶対に-10%を超えない
+                
+                if days_held >= 3:  # 3日経過後から損切り
+                    if pnl_rate <= -dynamic_stop:
+                        regime_name = daily_signals[ticker].get('regime_name', '不明')
+                        sell_reason = f"損切り ({pnl_rate:.1f}%, 閾値-{dynamic_stop:.1f}%, {regime_name})"
+                        sell_ratio = 1.0
+            
+            # ========== v9.0: 絶対ハードストップ -10% ==========
+            # どんな状況でも-10%で強制損切り
+            if sell_ratio == 0 and pnl_rate <= -10:
+                sell_reason = f"ハードストップ ({pnl_rate:.1f}%)"
+                sell_ratio = 1.0
+            
+            # ========== v7.0: 段階的トレーリングストップ ==========
+            # 利益が大きいほどトレーリングを緩く（利益を伸ばす）
+            if sell_ratio == 0 and pnl_rate > 0:
+                if pnl_rate >= 50:  # 50%以上の利益は高値から-15%で売却
+                    trailing_threshold = 15
+                elif pnl_rate >= 30:  # 30%以上は-12%
+                    trailing_threshold = 12
+                elif pnl_rate >= 15:  # 15%以上は-10%
+                    trailing_threshold = 10
+                else:  # それ以外は-7%
+                    trailing_threshold = 7
+                
+                if drop_from_high >= trailing_threshold:
+                    sell_reason = f"トレーリングストップ (高値から-{drop_from_high:.1f}%, 閾値{trailing_threshold}%)"
+                    sell_ratio = 1.0
+            
+            # ========== v7.0: 利確ロジック ==========
+            # 利確は段階的に、かつ全売却（半分売りの繰り返し問題を解消）
+            if sell_ratio == 0:
+                if pnl_rate >= 50:  # +50%以上で3/4売却
+                    sell_reason = f"大幅利確 ({pnl_rate:.1f}%)"
+                    sell_ratio = 0.75
+                elif pnl_rate >= 30:  # +30%以上で半分売却
+                    # ただし前回の利確から5日以上経過している場合のみ
+                    last_partial_sell = pos.get('last_partial_sell_day', 0)
+                    if days_held - last_partial_sell >= 5:
+                        sell_reason = f"利確 ({pnl_rate:.1f}%)"
+                        sell_ratio = 0.5
+                        portfolio[ticker]['last_partial_sell_day'] = days_held
+            
             # 強い売りシグナル
-            elif score <= -0.5:
+            if sell_ratio == 0 and score <= -0.5:
                 sell_reason = f"強い売り (スコア {score:.2f})"
                 sell_ratio = 1.0
-            # 売りシグナル
-            elif score <= -0.2:
-                sell_reason = f"売り (スコア {score:.2f})"
-                sell_ratio = 0.5
+            
+            # ========== v7.5b: シグナル売り ==========
+            # 利益時は半分売り、損失-3%以上のみ全売り
+            if sell_ratio == 0 and score <= -0.2:
+                if pnl_rate > 0:
+                    sell_reason = f"売り (スコア {score:.2f})"
+                    sell_ratio = 0.5
+                elif pnl_rate <= -3:
+                    sell_reason = f"損切り売り (スコア {score:.2f})"
+                    sell_ratio = 1.0
             
             if sell_ratio > 0:
                 shares_to_sell = pos['shares'] * sell_ratio
                 amount = shares_to_sell * price
                 cash += amount
+                
+                # ========== v6新規: 拡張実績トラッキング ==========
+                if pnl_rate > 0:
+                    ticker_performance[ticker]['wins'] += 1
+                    ticker_performance[ticker]['consecutive_losses'] = 0  # 連敗リセット
+                    if pnl_rate >= 20:  # 大勝ち記録
+                        ticker_performance[ticker]['big_wins'] += 1
+                    if pnl_rate > ticker_performance[ticker]['best_pnl']:
+                        ticker_performance[ticker]['best_pnl'] = pnl_rate
+                else:
+                    ticker_performance[ticker]['losses'] += 1
+                    ticker_performance[ticker]['consecutive_losses'] += 1
+                    ticker_performance[ticker]['last_loss_day'] = day_num
+                    
+                ticker_performance[ticker]['total_pnl'] += pnl_rate
+                ticker_performance[ticker]['trade_count'] += 1
+                
+                # v8.3: セクターパフォーマンス更新
+                ticker_sector = ticker_sectors.get(ticker, 'other')
+                if pnl_rate > 0:
+                    sector_performance[ticker_sector]['wins'] += 1
+                else:
+                    sector_performance[ticker_sector]['losses'] += 1
+                sector_performance[ticker_sector]['total_pnl'] += pnl_rate
                 
                 trades.append({
                     'date': current_date,
@@ -272,7 +824,8 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     'shares': shares_to_sell,
                     'price': price,
                     'amount': amount,
-                    'reason': sell_reason
+                    'reason': sell_reason,
+                    'pnl_rate': pnl_rate
                 })
                 
                 if sell_ratio >= 1.0:
@@ -281,50 +834,281 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     portfolio[ticker]['shares'] -= shares_to_sell
         
         # ========== 買い処理 ==========
-        # スコア順にソート
-        buy_candidates = [
-            (t, s) for t, s in daily_signals.items()
-            if s['total_score'] >= 0.2 and t not in portfolio
-        ]
-        buy_candidates.sort(key=lambda x: x[1]['total_score'], reverse=True)
+        # ========== v6新規: 弱気相場では完全停止 ==========
+        if market_is_bullish:
+            buy_budget_ratio = 1.0
+            min_buy_score = 0.2
+        else:
+            buy_budget_ratio = 0.0  # 弱気時は買わない
+            min_buy_score = 1.0  # 事実上買い不可
         
-        for ticker, signal in buy_candidates:
-            score = signal['total_score']
-            price = daily_prices[ticker]
+        # ========== 改善v5: 既存ポジションへの買い増し ==========
+        # 好成績銘柄が押し目にきたら買い増し
+        if market_is_bullish and buy_budget_ratio > 0:
+            for ticker in list(portfolio.keys()):
+                if ticker not in daily_signals:
+                    continue
+                
+                pos = portfolio[ticker]
+                signal = daily_signals[ticker]
+                price = daily_prices.get(ticker, pos['avg_cost'])
+                score = signal['total_score']
+                pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100
+                bb_position = signal.get('bb_position', 0.5)
+                
+                # ========== v7.5b: 買い増し条件（ピラミッディング） ==========
+                # 買い増し条件:
+                # 1. 現在利益が出ている（+5%以上）
+                # 2. 過去実績が良い（勝率50%以上）
+                # 3. 押し目（BB中央より下）
+                # 4. スコアがプラス
+                perf = ticker_performance[ticker]
+                
+                if (pnl_rate >= 5 and
+                    perf['trade_count'] >= 2 and 
+                    perf['wins'] / perf['trade_count'] >= 0.5 and
+                    bb_position < 0.5 and
+                    score >= 0.15):
+                    
+                    current_total = cash + sum(
+                        portfolio[t]['shares'] * daily_prices.get(t, portfolio[t]['avg_cost'])
+                        for t in portfolio
+                    )
+                    position_value = pos['shares'] * price
+                    position_ratio = position_value / current_total
+                    
+                    # 現在のポジションが15%未満なら買い増し可能（大勝ち銘柄は18%まで）
+                    max_add_ratio = 0.18 if ticker_performance[ticker]['big_wins'] >= 1 else 0.15
+                    if position_ratio < max_add_ratio and cash > current_total * 0.10:
+                        # 買い増し額: 総資産の7%
+                        add_amount = min(current_total * 0.07, cash - current_total * 0.08)
+                        if add_amount > 15000:  # 最低1.5万円以上
+                            add_shares = add_amount / price
+                            cash -= add_amount
+                            
+                            # 平均コストを更新
+                            total_shares = pos['shares'] + add_shares
+                            new_avg_cost = (pos['shares'] * pos['avg_cost'] + add_shares * price) / total_shares
+                            portfolio[ticker]['shares'] = total_shares
+                            portfolio[ticker]['avg_cost'] = new_avg_cost
+                            
+                            trades.append({
+                                'date': current_date,
+                                'ticker': ticker,
+                                'action': 'BUY',
+                                'shares': add_shares,
+                                'price': price,
+                                'amount': add_amount,
+                                'reason': f"買い増し (利益{pnl_rate:.1f}%, 勝率{perf['wins']/perf['trade_count']*100:.0f}%)"
+                            })
+        
+        # 買い候補を選定
+        buy_candidates = []
+        for ticker, signal in daily_signals.items():
+            if ticker in portfolio:  # 既存ポジションは買い増しで対応済み
+                continue
             
-            # 現金比率チェック（20%キープ）
+            score = signal['total_score']
+            price = signal['price']
+            change = signal['change']
+            is_uptrend = signal.get('is_uptrend', True)
+            bb_position = signal.get('bb_position', 0.5)
+            momentum_20d = signal.get('momentum_20d', 0)
+            risk_adj_momentum = signal.get('risk_adjusted_momentum', 0)
+            
+            # 条件1: スコアが閾値以上（市場状況で変化）
+            if score < min_buy_score:
+                continue
+            
+            # 条件2: 銘柄自体が上昇トレンド（50日MA > 200日MA）
+            if not is_uptrend:
+                continue
+            
+            # 条件3: 2日連続で買いシグナル
+            prev_signal = prev_day_signals.get(ticker, {})
+            prev_score = prev_signal.get('total_score', 0) if prev_signal else 0
+            if prev_score < 0.15:  # 前日は緩めの条件
+                continue
+            
+            # 条件4: 高値追い回避（前日比+3%以上は見送り）
+            if change > 3:
+                continue
+            
+            # 条件5: 押し目買い優先（BB中央より下）
+            if bb_position > 0.7:
+                continue
+            
+            # ========== v6新規: 拡張フィルター ==========
+            perf = ticker_performance[ticker]
+            
+            # ブラックリストチェック: 2連敗以上で20日間は買い禁止
+            if perf['consecutive_losses'] >= 2:
+                days_since_loss = day_num - perf['last_loss_day']
+                if days_since_loss < 20:
+                    continue  # ブラックリスト期間中
+            
+            # 過去実績フィルター
+            if perf['trade_count'] >= 2:
+                win_rate = perf['wins'] / perf['trade_count']
+                avg_pnl = perf['total_pnl'] / perf['trade_count']
+                
+                # 勝率30%未満、または平均損益-5%以下の銘柄は買わない
+                if win_rate < 0.3 or avg_pnl < -5:
+                    continue
+                
+                # ========== v6新規: 拡張実績スコア ==========
+                # 基本スコア
+                perf_score = win_rate * 0.4 + min(max(avg_pnl / 30, -1), 1) * 0.3
+                
+                # 大勝ちボーナス: +20%以上の取引があった銘柄を優遇
+                if perf['big_wins'] > 0:
+                    perf_score += 0.2
+                
+                # 最高利益ボーナス
+                if perf['best_pnl'] >= 30:
+                    perf_score += 0.1
+            else:
+                perf_score = 0.5  # 実績不足は中立
+            
+            # ========== v7新規: スクイーズブレイクアウトボーナス ==========
+            squeeze_bonus = signal.get('squeeze_bonus', 0.0)
+            
+            # ========== v7新規: ケリー基準による最適配分計算 ==========
+            # Kelly % = W - [(1-W) / R]
+            # W = 勝率, R = 勝ち時の平均利益 / 負け時の平均損失
+            if perf['trade_count'] >= 3 and perf['wins'] > 0 and perf['losses'] > 0:
+                win_rate = perf['wins'] / perf['trade_count']
+                # 簡易計算: 勝ち時は+10%, 負け時は-5%と仮定（実際の平均を使うとより精密）
+                avg_win = max(5, perf['best_pnl'] / 2)  # 推定勝ち幅
+                avg_loss = 5  # 推定負け幅
+                kelly_ratio = win_rate - ((1 - win_rate) / (avg_win / avg_loss))
+                kelly_ratio = max(0, min(0.25, kelly_ratio))  # 0〜25%に制限（ハーフケリー推奨）
+            else:
+                kelly_ratio = 0.10  # デフォルト10%
+            
+            # ========== v7新規: レジーム調整スコア ==========
+            regime_adjusted_score = signal.get('regime_adjusted_score', score)
+            
+            # ========== v8.3: セクターパフォーマンスボーナス ==========
+            ticker_sector = ticker_sectors.get(ticker, 'other')
+            sector_perf = sector_performance[ticker_sector]
+            sector_trades = sector_perf['wins'] + sector_perf['losses']
+            if sector_trades >= 3:
+                sector_win_rate = sector_perf['wins'] / sector_trades
+                sector_avg_pnl = sector_perf['total_pnl'] / sector_trades
+                # 勝率60%以上かつ平均利益5%以上のセクターにボーナス
+                if sector_win_rate >= 0.6 and sector_avg_pnl >= 5:
+                    sector_bonus = 0.15
+                elif sector_win_rate >= 0.5 and sector_avg_pnl >= 0:
+                    sector_bonus = 0.05
+                elif sector_win_rate < 0.4 or sector_avg_pnl < -5:
+                    sector_bonus = -0.1  # 不調セクターはペナルティ
+                else:
+                    sector_bonus = 0
+            else:
+                sector_bonus = 0
+            
+            # 最終スコア = シグナルスコア + 実績ボーナス + モメンタム + スクイーズ + レジーム + セクター
+            momentum_bonus = min(0.3, max(-0.3, risk_adj_momentum * 0.1))
+            final_score = regime_adjusted_score + perf_score * 0.4 + momentum_bonus + squeeze_bonus + sector_bonus
+            
+            buy_candidates.append((ticker, signal, final_score, perf_score, momentum_20d, kelly_ratio))
+        
+        # ========== v6新規: モメンタムランキングでソート ==========
+        # 最終スコアでソート（モメンタム込み）
+        buy_candidates.sort(key=lambda x: x[2], reverse=True)
+        
+        # ========== v7新規: セクター分散フィルター ==========
+        # 同一セクターからの購入は最大2銘柄まで
+        sector_count = {}
+        for t in portfolio:
+            sector = ticker_sectors.get(t, 'other')
+            sector_count[sector] = sector_count.get(sector, 0) + 1
+        
+        # ========== v7.5b: 上位銘柄に集中投資 ==========
+        daily_buy_count = 0
+        max_daily_buys = 2  # 1日2銘柄に絞って集中
+        
+        for ticker, signal, final_score, perf_score, momentum, kelly_ratio in buy_candidates:
+            if daily_buy_count >= max_daily_buys:
+                break
+            
+            # ========== v7新規: セクター集中回避 ==========
+            ticker_sector = ticker_sectors.get(ticker, 'other')
+            if sector_count.get(ticker_sector, 0) >= 2:
+                continue  # 同一セクター2銘柄以上は回避
+            
+            price = daily_prices[ticker]
+            score = signal['total_score']
+            
+            # v8.6: 現金比率を下げて投資機会を増やす
+            min_cash_ratio = 0.05  # 8% → 5%
             current_total = cash + sum(
                 portfolio[t]['shares'] * daily_prices.get(t, portfolio[t]['avg_cost'])
                 for t in portfolio
             )
-            if cash < current_total * 0.20:
+            if cash < current_total * min_cash_ratio:
                 break
             
-            # 保有銘柄数チェック（最大10銘柄）
-            if len(portfolio) >= 10:
+            # v8.6: 保有銘柄数を増やす（最大8銘柄）
+            if len(portfolio) >= 8:
                 break
             
-            # 購入額決定
-            if score >= 0.5:
-                buy_amount = current_total * 0.08
+            # ========== v8.6: 勝者への集中投資強化 ==========
+            # ケリー比率を基本に、スコアと実績で調整
+            base_ratio = max(0.12, kelly_ratio * 1.5)  # ベース比率を上げる（10%→12%）
+            
+            # 過去に大勝ちした銘柄は倍率アップ（最大3.0倍に強化）
+            perf = ticker_performance[ticker]
+            if perf['big_wins'] >= 2:  # 2回以上大勝ち
+                alloc_multiplier = 3.0  # 2.5 → 3.0
+            elif perf['big_wins'] >= 1:  # 1回大勝ち
+                alloc_multiplier = 2.5  # 2.0 → 2.5
+            elif perf_score >= 0.7:
+                alloc_multiplier = 1.8  # 1.5 → 1.8
+            elif perf_score >= 0.5:
+                alloc_multiplier = 1.3  # 1.2 → 1.3
             else:
-                buy_amount = current_total * 0.05
+                alloc_multiplier = 1.0
             
-            # 上限チェック
-            max_position = current_total * 0.10
+            # スクイーズブレイクアウト時はさらに積極的に
+            squeeze_bonus = signal.get('squeeze_bonus', 0.0)
+            if squeeze_bonus > 0:
+                alloc_multiplier *= 1.3
+            
+            buy_amount = current_total * base_ratio * alloc_multiplier * buy_budget_ratio
+            
+            # v8.6: 上限を引き上げ（最大25%まで）
+            max_position = current_total * 0.25
             buy_amount = min(buy_amount, max_position)
             
-            available_cash = cash - (current_total * 0.20)
+            available_cash = cash - (current_total * min_cash_ratio)
             buy_amount = min(buy_amount, available_cash)
             
-            if buy_amount > 10000:
+            # ========== v7.0: 最低購入額 ==========
+            if buy_amount > 50000:  # 5万円以上のみ購入
                 shares = buy_amount / price
                 cash -= buy_amount
                 
                 portfolio[ticker] = {
                     'shares': shares,
-                    'avg_cost': price
+                    'avg_cost': price,
+                    'high_since_buy': price,
+                    'buy_date': current_date,
+                    'days_held': 0,
+                    'last_partial_sell_day': 0
                 }
+                
+                # セクターカウント更新
+                sector_count[ticker_sector] = sector_count.get(ticker_sector, 0) + 1
+                
+                # 詳細な購入理由
+                perf = ticker_performance[ticker]
+                big_win_info = f", 大勝{perf['big_wins']}回" if perf['big_wins'] > 0 else ""
+                momentum_info = f", M{momentum:.1f}%" if momentum != 0 else ""
+                regime_name = signal.get('regime_name', '')
+                squeeze_info = ", SQ" if squeeze_bonus > 0 else ""
+                kelly_info = f", K{kelly_ratio*100:.0f}%"
                 
                 trades.append({
                     'date': current_date,
@@ -333,8 +1117,13 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     'shares': shares,
                     'price': price,
                     'amount': buy_amount,
-                    'reason': f"{'強い' if score >= 0.5 else ''}買い (スコア {score:.2f})"
+                    'reason': f"買い (S{score:.2f}{big_win_info}{momentum_info}{kelly_info}{squeeze_info}, {regime_name})"
                 })
+                
+                daily_buy_count += 1
+        
+        # シグナル履歴を更新
+        prev_day_signals = daily_signals.copy()
         
         # 日次記録
         stock_value = sum(
@@ -348,7 +1137,8 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             'cash': cash,
             'stock_value': stock_value,
             'total_value': total_value,
-            'num_positions': len(portfolio)
+            'num_positions': len(portfolio),
+            'market_bullish': market_is_bullish
         })
     
     if progress_callback:
@@ -358,7 +1148,8 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         'history': history,
         'trades': trades,
         'final_portfolio': portfolio,
-        'final_cash': cash
+        'final_cash': cash,
+        'ticker_performance': ticker_performance  # 銘柄別の累積実績
     }
 
 
@@ -366,6 +1157,12 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
 
 # サイドバー設定
 st.sidebar.header("⚙️ バックテスト設定")
+
+# キャッシュクリアボタン
+if st.sidebar.button("🔄 データキャッシュをクリア"):
+    st.cache_data.clear()
+    st.sidebar.success("キャッシュをクリアしました")
+    st.rerun()
 
 # 期間選択
 period_options = {
@@ -401,30 +1198,79 @@ else:
 st.sidebar.metric("選択銘柄数", len(selected_tickers))
 
 # アルゴリズム説明
-with st.expander("📋 売買アルゴリズム（案C: リスク管理型）", expanded=False):
+with st.expander("📋 売買アルゴリズム（改善版 v9.0c - 最新研究 + 独自手法）", expanded=False):
     st.markdown("""
     ### ウォークフォワードテストとは
     各日の判断は**その日までのデータのみ**を使用し、未来のデータは一切見ません。
-    これにより実際の運用に近いシミュレーションが可能です。
     
-    ### 資金管理ルール
-    - **現金比率**: 常に20%以上キープ
-    - **1銘柄上限**: 総資産の10%まで
-    - **最大保有銘柄数**: 10銘柄
+    ### 🧪 v7.0 最新研究ベースの改善
     
-    ### 買いルール
-    | スコア | 条件 | 購入額 |
-    |--------|------|--------|
-    | ≥ 0.5 | 未保有のみ | 総資産の8% |
-    | ≥ 0.2 | 未保有のみ | 総資産の5% |
+    #### 📚 学術研究から導入した手法
+    
+    **1. レジームスイッチング（Market Regime Detection）**
+    市場を4つの状態に分類し、各状態で最適な戦略を適用：
+    | レジーム | 買い倍率 | 損切り倍率 | 特徴 |
+    |---------|---------|-----------|------|
+    | 低ボラ上昇 | 1.2x | 0.8x | 最良環境、積極投資 |
+    | 高ボラ上昇 | 0.8x | 1.2x | 慎重に、利益は広めに |
+    | 低ボラ下降 | 0.0x | 1.0x | 買い停止 |
+    | 高ボラ下降 | 0.3x | 1.5x | ほぼ停止、損切り広め |
+    
+    **2. ケリー基準（Kelly Criterion）**
+    $$f^* = W - \\frac{1-W}{R}$$
+    - $W$ = 勝率、$R$ = 平均勝ち幅 / 平均負け幅
+    - 各銘柄の過去実績から最適ポジションサイズを計算
+    - ハーフケリー×1.5で積極的に運用
+    
+    **3. ボラティリティスクイーズ（TTM Squeeze）**
+    - ボリンジャーバンドがケルトナーチャネル内に収まった状態を検出
+    - 収縮後の拡大 = ブレイクアウトのチャンス
+    - スクイーズ中 & 上向きモメンタム → 配分1.3倍ボーナス
+    
+    **4. ケルトナーチャネル（Keltner Channel）**
+    - ATRベースの動的チャネル
+    - ボリンジャーより安定したトレンド判定
+    
+    #### 🎨 独自手法
+    
+    **5. セクター分散**
+    - 同一セクターは最大2銘柄まで
+    - 米国株: tech, finance, health, energy, other
+    - 日本株: 証券コードから推定
+    
+    **6. アダプティブ損切り**
+    - レジームに応じて損切り幅を自動調整
+    - 高ボラ時は広め、低ボラ時は狭め
+    
+    #### 🎯 v7.0 パラメータ
+    | 項目 | v6.0 | v7.0 |
+    |------|------|------|
+    | 1銘柄上限 | 20% | **22%** |
+    | 基本配分 | 固定12-15% | **ケリー基準×1.5** |
+    | 損切り幅 | ATR×3固定 | **レジーム×ATR×3** |
+    | セクター制限 | なし | **同一2銘柄まで** |
+    | スクイーズ | なし | **ボーナス1.3倍** |
+    
+    #### 💰 勝者優遇配分（v6継続）
+    | 条件 | 配分倍率 |
+    |------|---------|
+    | 大勝ち2回以上 | **2.5倍** |
+    | 大勝ち1回 | **2.0倍** |
+    | スクイーズ中 | **×1.3倍** |
+    | 通常 | 1.0倍 |
+    
+    #### 🚫 敗者ブラックリスト（v6継続）
+    - **2連敗した銘柄は20日間買い禁止**
     
     ### 売りルール
     | 条件 | アクション |
     |------|-----------|
-    | 損切: -10%到達 | 全売却 |
-    | 利確: +20%到達 | 半分売却 |
-    | スコア ≤ -0.5 | 全売却 |
-    | スコア ≤ -0.2 | 半分売却 |
+    | ポジション < 0.5% | 整理売却 |
+    | 損切: レジーム×ATR×3 | 全売却（3日猶予） |
+    | トレーリング | 利益に応じて-7%〜-15% |
+    | 利確+50% | 3/4売却 |
+    | 利確+30% | 半分売却 |
+    | シグナル売り & 損失-3%超 | 全売却 |
     """)
 
 # バックテスト実行
@@ -456,6 +1302,15 @@ if st.button("🚀 バックテスト実行", type="primary", use_container_widt
         
         if result is None:
             st.error("バックテストに失敗しました。銘柄データが不足している可能性があります。")
+        elif 'error' in result:
+            st.error(f"⚠️ {result['error']}")
+            st.info(f"必要なデータ日数: {test_days + 200}日以上（{test_days}日テスト + 200日MA計算用）")
+            st.info("💡 キャッシュをクリアして再試行してみてください")
+            if st.button("🔄 キャッシュをクリア"):
+                st.cache_data.clear()
+                st.rerun()
+        elif 'history' not in result:
+            st.error("バックテスト結果が不正です")
         else:
             st.session_state['backtest_result'] = result
             st.success("✅ バックテスト完了！")
@@ -488,12 +1343,16 @@ if 'backtest_result' in st.session_state:
     buy_trades = [t for t in trades if t['action'] == 'BUY']
     sell_trades = [t for t in trades if t['action'] == 'SELL']
     
+    # 勝率計算（売り取引で利益が出たもの）
+    profitable_sells = [t for t in sell_trades if t.get('pnl_rate', 0) > 0]
+    win_rate = (len(profitable_sells) / len(sell_trades) * 100) if sell_trades else 0
+    
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("💰 最終資産", f"¥{final:,.0f}", delta=f"¥{profit:+,.0f}")
     col2.metric("📈 収益率", f"{profit_rate:+.2f}%")
     col3.metric("📉 最大DD", f"-{max_drawdown:.2f}%")
     col4.metric("🔄 総取引数", len(trades))
-    col5.metric("📊 勝率", f"{len([t for t in sell_trades if '利確' in t.get('reason', '')])}/{len(sell_trades)}")
+    col5.metric("📊 勝率", f"{win_rate:.1f}%")
     
     st.divider()
     
@@ -510,6 +1369,29 @@ if 'backtest_result' in st.session_state:
                         vertical_spacing=0.1,
                         row_heights=[0.7, 0.3],
                         subplot_titles=("総資産推移", "保有銘柄数"))
+    
+    # 市場弱気期間を背景色で表示
+    if 'market_bullish' in df_history.columns:
+        bearish_periods = []
+        in_bearish = False
+        start_date = None
+        
+        for i, row in df_history.iterrows():
+            if not row.get('market_bullish', True) and not in_bearish:
+                in_bearish = True
+                start_date = row['date']
+            elif row.get('market_bullish', True) and in_bearish:
+                in_bearish = False
+                bearish_periods.append((start_date, row['date']))
+        
+        if in_bearish:
+            bearish_periods.append((start_date, df_history['date'].iloc[-1]))
+        
+        for start, end in bearish_periods:
+            fig.add_vrect(x0=start, x1=end, fillcolor="red", opacity=0.1, 
+                          layer="below", line_width=0, row=1, col=1)
+            fig.add_vrect(x0=start, x1=end, fillcolor="red", opacity=0.1, 
+                          layer="below", line_width=0, row=2, col=1)
     
     # 総資産
     fig.add_trace(go.Scatter(
@@ -566,10 +1448,17 @@ if 'backtest_result' in st.session_state:
             sell_df['price'] = sell_df['price'].apply(lambda x: f"${x:.2f}")
             sell_df['amount'] = sell_df['amount'].apply(lambda x: f"¥{x:,.0f}")
             sell_df['shares'] = sell_df['shares'].apply(lambda x: f"{x:.2f}")
-            st.dataframe(
-                sell_df[['date', 'ticker', 'shares', 'price', 'amount', 'reason']],
-                use_container_width=True, hide_index=True
-            )
+            if 'pnl_rate' in sell_df.columns:
+                sell_df['pnl'] = sell_df['pnl_rate'].apply(lambda x: f"{x:+.1f}%" if pd.notna(x) else "-")
+                st.dataframe(
+                    sell_df[['date', 'ticker', 'shares', 'price', 'amount', 'pnl', 'reason']],
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.dataframe(
+                    sell_df[['date', 'ticker', 'shares', 'price', 'amount', 'reason']],
+                    use_container_width=True, hide_index=True
+                )
         else:
             st.info("売り取引なし")
     
@@ -611,6 +1500,150 @@ if 'backtest_result' in st.session_state:
                 '平均取得単価': f"${pos['avg_cost']:.2f}"
             })
         st.dataframe(pd.DataFrame(final_portfolio_data), use_container_width=True, hide_index=True)
+    
+    # ==================== 詳細分析セクション ====================
+    st.divider()
+    st.subheader("🔬 詳細分析")
+    
+    # 分析実行ボタン
+    if st.button("📊 詳細分析を実行", type="secondary"):
+        with st.spinner("分析中..."):
+            analysis = analyze_backtest_results(history, trades)
+            st.session_state['backtest_analysis'] = analysis
+    
+    if 'backtest_analysis' in st.session_state:
+        analysis = st.session_state['backtest_analysis']
+        
+        # タブで表示
+        tab_basic, tab_risk, tab_trades, tab_tickers, tab_problems = st.tabs([
+            "📈 基本統計", "⚠️ リスク指標", "🔄 取引分析", "📊 銘柄別", "💡 改善提案"
+        ])
+        
+        with tab_basic:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("### 基本統計")
+                for key, value in analysis.get('基本統計', {}).items():
+                    st.write(f"**{key}**: {value}")
+            with col2:
+                st.markdown("### 月次パフォーマンス")
+                monthly_data = analysis.get('月次パフォーマンス', [])
+                if monthly_data:
+                    df_monthly = pd.DataFrame(monthly_data)
+                    st.dataframe(df_monthly, use_container_width=True, hide_index=True)
+        
+        with tab_risk:
+            st.markdown("### リスク指標")
+            for key, value in analysis.get('リスク指標', {}).items():
+                st.write(f"**{key}**: {value}")
+        
+        with tab_trades:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("### 取引統計")
+                for key, value in analysis.get('取引統計', {}).items():
+                    st.write(f"**{key}**: {value}")
+                
+                st.markdown("### 売り取引分析")
+                for key, value in analysis.get('売り取引分析', {}).items():
+                    st.write(f"**{key}**: {value}")
+            
+            with col2:
+                st.markdown("### 売却理由別")
+                reason_data = analysis.get('売却理由別', {})
+                if reason_data:
+                    reason_df = []
+                    for reason, stats in reason_data.items():
+                        reason_df.append({
+                            '理由': reason,
+                            '回数': stats['回数'],
+                            '平均損益': stats['平均損益']
+                        })
+                    st.dataframe(pd.DataFrame(reason_df), use_container_width=True, hide_index=True)
+        
+        with tab_tickers:
+            st.markdown("### 銘柄別パフォーマンス")
+            ticker_data = analysis.get('銘柄別パフォーマンス', [])
+            if ticker_data:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("#### 🏆 上位5銘柄")
+                    top_df = pd.DataFrame(ticker_data[:5])
+                    top_df['平均損益率'] = top_df['平均損益率'].apply(lambda x: f"{x:.1f}%")
+                    top_df['投資額合計'] = top_df['投資額合計'].apply(lambda x: f"¥{x:,.0f}")
+                    st.dataframe(top_df, use_container_width=True, hide_index=True)
+                
+                with col2:
+                    st.markdown("#### 📉 下位5銘柄")
+                    bottom_df = pd.DataFrame(ticker_data[-5:])
+                    bottom_df['平均損益率'] = bottom_df['平均損益率'].apply(lambda x: f"{x:.1f}%")
+                    bottom_df['投資額合計'] = bottom_df['投資額合計'].apply(lambda x: f"¥{x:,.0f}")
+                    st.dataframe(bottom_df, use_container_width=True, hide_index=True)
+        
+        with tab_problems:
+            st.markdown("### ⚠️ 問題点")
+            problems = analysis.get('問題点', [])
+            if problems:
+                for p in problems:
+                    st.warning(p)
+            else:
+                st.success("大きな問題点は見つかりませんでした")
+            
+            st.markdown("### 💡 改善提案")
+            suggestions = analysis.get('改善提案', [])
+            for s in suggestions:
+                st.info(s)
+        
+        # 結果保存ボタン
+        st.divider()
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("💾 結果をJSONで保存"):
+                # 保存用データ作成
+                save_data = {
+                    'timestamp': datetime.now().isoformat(),
+                    'analysis': analysis,
+                    'trades': trades,
+                    'history_summary': {
+                        'initial': history[0]['total_value'],
+                        'final': history[-1]['total_value'],
+                        'days': len(history)
+                    }
+                }
+                
+                # ファイル保存
+                save_path = Path(__file__).parent.parent / "analysis" / f"backtest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                
+                # datetime変換
+                def convert_datetime(obj):
+                    if hasattr(obj, 'isoformat'):
+                        return obj.isoformat()
+                    elif hasattr(obj, '__str__'):
+                        return str(obj)
+                    return obj
+                
+                # tradesのdatetime変換
+                trades_serializable = []
+                for t in trades:
+                    t_copy = t.copy()
+                    if 'date' in t_copy:
+                        t_copy['date'] = convert_datetime(t_copy['date'])
+                    trades_serializable.append(t_copy)
+                save_data['trades'] = trades_serializable
+                
+                with open(save_path, 'w', encoding='utf-8') as f:
+                    json.dump(save_data, f, ensure_ascii=False, indent=2, default=str)
+                
+                st.success(f"✅ 保存しました: {save_path.name}")
+        
+        with col2:
+            # CSVエクスポート
+            if st.button("📥 取引履歴をCSV出力"):
+                trades_df = pd.DataFrame(trades)
+                csv_path = Path(__file__).parent.parent / "analysis" / f"trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                trades_df.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                st.success(f"✅ 保存しました: {csv_path.name}")
 
 else:
     st.info("👆 「バックテスト実行」ボタンを押してシミュレーションを開始してください")
