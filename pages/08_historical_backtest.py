@@ -506,6 +506,13 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
     if market_data is None:
         st.warning("市場データ(SPY)が取得できません。市場フィルターを無効化します。")
     
+    # ========== v10.0: VIXデータ取得（レジーム検知用） ==========
+    vix_data = get_historical_data("^VIX", "3y")
+    if vix_data is None:
+        st.warning("VIXデータが取得できません。VIXフィルターを無効化します。")
+    else:
+        st.info("✅ VIXデータ取得成功 - 高度なレジーム検知を有効化")
+    
     if not all_data:
         return {'error': f"データ不足の銘柄: {', '.join(failed_tickers)}", 'failed_tickers': failed_tickers}
     
@@ -583,6 +590,13 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         'other': {'wins': 0, 'losses': 0, 'total_pnl': 0.0}
     }
     
+    # ========== v10.0: ドローダウン追跡（DD連動ポジション縮小用） ==========
+    peak_equity = initial_cash  # 最高資産額
+    current_dd_multiplier = 1.0  # DD連動のポジション倍率
+    
+    # ========== v10.0: VIXレジーム履歴 ==========
+    vix_regime_history = []  # VIXレジーム変化の追跡
+    
     total_days = len(date_index)
     
     for day_num, current_date in enumerate(date_index):
@@ -598,6 +612,40 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                 market_sma200 = market_slice['Close'].rolling(200).mean().iloc[-1]
                 market_price = market_slice['Close'].iloc[-1]
                 market_is_bullish = market_price > market_sma200
+        
+        # ========== v10.0: VIXベースのレジーム検知 ==========
+        vix_level = 20.0  # デフォルト（データなしの場合）
+        vix_regime = "NORMAL"  # NORMAL, CAUTION, FEAR, PANIC
+        vix_position_multiplier = 1.0
+        vix_momentum = 0.0
+        
+        if vix_data is not None:
+            vix_mask = vix_data.index <= current_date
+            if vix_mask.sum() >= 10:
+                vix_slice = vix_data[vix_mask]
+                vix_level = float(vix_slice['Close'].iloc[-1])
+                
+                # VIXモメンタム（5日変化率）
+                if len(vix_slice) >= 6:
+                    vix_5d_ago = float(vix_slice['Close'].iloc[-6])
+                    vix_momentum = (vix_level - vix_5d_ago) / vix_5d_ago * 100
+                
+                # VIXレジーム判定
+                if vix_level >= 35:
+                    vix_regime = "PANIC"
+                    vix_position_multiplier = 0.0  # 完全停止
+                elif vix_level >= 30:
+                    vix_regime = "FEAR"
+                    vix_position_multiplier = 0.25  # 75%縮小
+                elif vix_level >= 25:
+                    vix_regime = "CAUTION"
+                    vix_position_multiplier = 0.5  # 50%縮小
+                elif vix_momentum > 15:  # VIXが5日で15%以上急上昇
+                    vix_regime = "CAUTION"
+                    vix_position_multiplier = 0.7  # 30%縮小
+                else:
+                    vix_regime = "NORMAL"
+                    vix_position_multiplier = 1.0
         
         # その日のシグナルを計算（各銘柄）
         daily_signals = {}
@@ -622,9 +670,82 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         )
         total_value = cash + stock_value
         
+        # ========== v10.0: ドローダウン連動ポジション縮小 ==========
+        # 最高資産を更新
+        if total_value > peak_equity:
+            peak_equity = total_value
+        
+        # 現在のドローダウンを計算
+        current_drawdown = (peak_equity - total_value) / peak_equity if peak_equity > 0 else 0
+        
+        # DD連動のポジション倍率を決定
+        if current_drawdown >= 0.05:  # 5%以上のDD
+            current_dd_multiplier = 0.25  # 75%縮小
+        elif current_drawdown >= 0.03:  # 3%以上のDD
+            current_dd_multiplier = 0.5   # 50%縮小
+        else:
+            current_dd_multiplier = 1.0   # 通常
+        
+        # ========== v10.0: 総合ポジション倍率（VIX × DD） ==========
+        combined_position_multiplier = vix_position_multiplier * current_dd_multiplier
+        
         # ========== 保有日数更新 ==========
         for ticker in portfolio:
             portfolio[ticker]['days_held'] = portfolio[ticker].get('days_held', 0) + 1
+        
+        # ========== v10.0: VIX PANIC/FEARレジームでの強制ポジション縮小 ==========
+        if vix_regime in ["PANIC", "FEAR"] and len(portfolio) > 0:
+            for ticker in list(portfolio.keys()):
+                if ticker not in daily_prices:
+                    continue
+                pos = portfolio[ticker]
+                price = daily_prices[ticker]
+                pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100
+                
+                sell_shares = 0
+                sell_reason = None
+                
+                if vix_regime == "PANIC":
+                    # PANICモード: 全ポジション即時売却
+                    sell_shares = pos['shares']
+                    sell_reason = f"VIX PANIC売却 (VIX:{vix_level:.1f}, PnL:{pnl_rate:.1f}%)"
+                elif vix_regime == "FEAR":
+                    # FEARモード: 損失ポジションは即売却、利益ポジションは50%売却
+                    if pnl_rate <= 0:
+                        sell_shares = pos['shares']
+                        sell_reason = f"VIX FEAR損切り (VIX:{vix_level:.1f}, PnL:{pnl_rate:.1f}%)"
+                    elif pnl_rate >= 3:
+                        sell_shares = pos['shares'] * 0.5
+                        sell_reason = f"VIX FEAR利確50% (VIX:{vix_level:.1f}, PnL:{pnl_rate:.1f}%)"
+                
+                if sell_shares > 0:
+                    amount = sell_shares * price
+                    cash += amount
+                    
+                    trades.append({
+                        'date': current_date,
+                        'ticker': ticker,
+                        'action': 'SELL',
+                        'shares': sell_shares,
+                        'price': price,
+                        'amount': amount,
+                        'reason': sell_reason,
+                        'pnl_rate': pnl_rate,
+                        'vix_level': vix_level,
+                        'vix_regime': vix_regime
+                    })
+                    
+                    # パフォーマンス記録
+                    if pnl_rate > 0:
+                        ticker_performance[ticker]['wins'] += 1
+                    else:
+                        ticker_performance[ticker]['losses'] += 1
+                    ticker_performance[ticker]['total_pnl'] += pnl_rate
+                    ticker_performance[ticker]['trade_count'] += 1
+                    
+                    portfolio[ticker]['shares'] -= sell_shares
+                    if portfolio[ticker]['shares'] < 0.01:
+                        del portfolio[ticker]
         
         # ========== v9.0c: 弱気相場でのポジション縮小強化 ==========
         # 市場がSMA200を下回ったら、ポジションを積極的に縮小
@@ -834,17 +955,31 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     portfolio[ticker]['shares'] -= shares_to_sell
         
         # ========== 買い処理 ==========
-        # ========== v6新規: 弱気相場では完全停止 ==========
-        if market_is_bullish:
-            buy_budget_ratio = 1.0
-            min_buy_score = 0.2
-        else:
-            buy_budget_ratio = 0.0  # 弱気時は買わない
-            min_buy_score = 1.0  # 事実上買い不可
+        # ========== v10.0: VIXレジーム + 市場トレンドによる買い制限 ==========
+        if vix_regime == "PANIC":
+            buy_budget_ratio = 0.0  # PANIC時は完全停止
+            min_buy_score = 1.0
+        elif vix_regime == "FEAR":
+            buy_budget_ratio = 0.0  # FEAR時も買い停止
+            min_buy_score = 1.0
+        elif vix_regime == "CAUTION":
+            if market_is_bullish:
+                buy_budget_ratio = 0.5 * combined_position_multiplier  # 警戒モード: 50%に制限
+                min_buy_score = 0.3  # より厳しいスコア要求
+            else:
+                buy_budget_ratio = 0.0
+                min_buy_score = 1.0
+        else:  # NORMAL
+            if market_is_bullish:
+                buy_budget_ratio = 1.0 * combined_position_multiplier
+                min_buy_score = 0.2
+            else:
+                buy_budget_ratio = 0.0  # 弱気時は買わない
+                min_buy_score = 1.0
         
         # ========== 改善v5: 既存ポジションへの買い増し ==========
-        # 好成績銘柄が押し目にきたら買い増し
-        if market_is_bullish and buy_budget_ratio > 0:
+        # 好成績銘柄が押し目にきたら買い増し（VIXがCAUTION以下で市場強気時のみ）
+        if market_is_bullish and buy_budget_ratio > 0 and vix_regime in ["NORMAL", "CAUTION"]:
             for ticker in list(portfolio.keys()):
                 if ticker not in daily_signals:
                     continue
@@ -1138,7 +1273,13 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             'stock_value': stock_value,
             'total_value': total_value,
             'num_positions': len(portfolio),
-            'market_bullish': market_is_bullish
+            'market_bullish': market_is_bullish,
+            # v10.0: VIXレジーム情報
+            'vix_level': vix_level,
+            'vix_regime': vix_regime,
+            'vix_momentum': vix_momentum,
+            'current_drawdown': current_drawdown,
+            'position_multiplier': combined_position_multiplier
         })
     
     if progress_callback:
@@ -1149,7 +1290,9 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         'trades': trades,
         'final_portfolio': portfolio,
         'final_cash': cash,
-        'ticker_performance': ticker_performance  # 銘柄別の累積実績
+        'ticker_performance': ticker_performance,
+        # v10.0: VIXレジーム統計
+        'vix_data_available': vix_data is not None
     }
 
 
@@ -1198,12 +1341,45 @@ else:
 st.sidebar.metric("選択銘柄数", len(selected_tickers))
 
 # アルゴリズム説明
-with st.expander("📋 売買アルゴリズム（改善版 v9.0c - 最新研究 + 独自手法）", expanded=False):
+with st.expander("📋 売買アルゴリズム（改善版 v10.0 - VIXレジーム検知 + DD連動）", expanded=False):
     st.markdown("""
     ### ウォークフォワードテストとは
     各日の判断は**その日までのデータのみ**を使用し、未来のデータは一切見ません。
     
-    ### 🧪 v7.0 最新研究ベースの改善
+    ### 🆕 v10.0 新機能（Deep Research統合）
+    
+    #### 🚨 VIXベースのレジーム検知（最優先改善）
+    VIX（恐怖指数）を監視し、市場のパニック状態を早期検知：
+    
+    | VIX水準 | レジーム | ポジション倍率 | アクション |
+    |--------|---------|--------------|-----------|
+    | VIX < 20 | NORMAL | 100% | 通常運用 |
+    | 20 ≤ VIX < 25 | NORMAL | 100% | 通常運用 |
+    | 25 ≤ VIX < 30 | CAUTION | 50% | 警戒モード |
+    | 30 ≤ VIX < 35 | FEAR | 25% | 損失ポジション即売却 |
+    | VIX ≥ 35 | PANIC | 0% | 全ポジション売却 |
+    
+    **VIXモメンタム検知**: 5日で+15%急上昇 → CAUTIONへ移行
+    
+    #### 📉 ドローダウン連動ポジション縮小
+    ポートフォリオ全体のDDを監視し、自動でリスク削減：
+    
+    | ドローダウン | ポジション倍率 | 説明 |
+    |------------|--------------|------|
+    | DD < 3% | 100% | 通常運用 |
+    | 3% ≤ DD < 5% | 50% | 半分に縮小 |
+    | DD ≥ 5% | 25% | 75%縮小 |
+    
+    **総合倍率 = VIX倍率 × DD倍率**（両方適用）
+    
+    #### 🎯 期待効果
+    - 3月型の急落: -3.71% → -1~2%に抑制
+    - シャープレシオ: 1.62 → 1.8~2.0
+    - 最大ドローダウン: 5.9% → 4%以下
+    
+    ---
+    
+    ### 🧪 v7.0 最新研究ベースの改善（継続）
     
     #### 📚 学術研究から導入した手法
     
@@ -1242,15 +1418,6 @@ with st.expander("📋 売買アルゴリズム（改善版 v9.0c - 最新研究
     - レジームに応じて損切り幅を自動調整
     - 高ボラ時は広め、低ボラ時は狭め
     
-    #### 🎯 v7.0 パラメータ
-    | 項目 | v6.0 | v7.0 |
-    |------|------|------|
-    | 1銘柄上限 | 20% | **22%** |
-    | 基本配分 | 固定12-15% | **ケリー基準×1.5** |
-    | 損切り幅 | ATR×3固定 | **レジーム×ATR×3** |
-    | セクター制限 | なし | **同一2銘柄まで** |
-    | スクイーズ | なし | **ボーナス1.3倍** |
-    
     #### 💰 勝者優遇配分（v6継続）
     | 条件 | 配分倍率 |
     |------|---------|
@@ -1265,6 +1432,8 @@ with st.expander("📋 売買アルゴリズム（改善版 v9.0c - 最新研究
     ### 売りルール
     | 条件 | アクション |
     |------|-----------|
+    | VIX PANIC | 全ポジション即売却 |
+    | VIX FEAR + 損失 | 即売却 |
     | ポジション < 0.5% | 整理売却 |
     | 損切: レジーム×ATR×3 | 全売却（3日猶予） |
     | トレーリング | 利益に応じて-7%〜-15% |
@@ -1354,6 +1523,49 @@ if 'backtest_result' in st.session_state:
     col4.metric("🔄 総取引数", len(trades))
     col5.metric("📊 勝率", f"{win_rate:.1f}%")
     
+    # VIXレジーム統計（v10.0新機能）
+    if result.get('vix_data_available', False) and 'vix_regime' in history[0]:
+        st.divider()
+        st.subheader("🚨 VIXレジーム分析 (v10.0)")
+        
+        # レジーム別日数カウント
+        regime_counts = {'NORMAL': 0, 'CAUTION': 0, 'FEAR': 0, 'PANIC': 0}
+        vix_values = []
+        for h in history:
+            regime = h.get('vix_regime', 'N/A')
+            if regime in regime_counts:
+                regime_counts[regime] += 1
+            vix_level = h.get('vix_level')
+            if vix_level is not None:
+                vix_values.append(vix_level)
+        
+        total_days = sum(regime_counts.values())
+        
+        # レジーム統計表示
+        rcol1, rcol2, rcol3, rcol4 = st.columns(4)
+        with rcol1:
+            pct = (regime_counts['NORMAL'] / total_days * 100) if total_days > 0 else 0
+            st.metric("🟢 NORMAL", f"{regime_counts['NORMAL']}日", f"{pct:.1f}%")
+        with rcol2:
+            pct = (regime_counts['CAUTION'] / total_days * 100) if total_days > 0 else 0
+            st.metric("🟡 CAUTION", f"{regime_counts['CAUTION']}日", f"{pct:.1f}%")
+        with rcol3:
+            pct = (regime_counts['FEAR'] / total_days * 100) if total_days > 0 else 0
+            st.metric("🟠 FEAR", f"{regime_counts['FEAR']}日", f"{pct:.1f}%", delta_color="inverse")
+        with rcol4:
+            pct = (regime_counts['PANIC'] / total_days * 100) if total_days > 0 else 0
+            st.metric("🔴 PANIC", f"{regime_counts['PANIC']}日", f"{pct:.1f}%", delta_color="inverse")
+        
+        # VIX統計
+        if vix_values:
+            vcol1, vcol2, vcol3, vcol4 = st.columns(4)
+            vcol1.metric("📊 VIX平均", f"{sum(vix_values)/len(vix_values):.1f}")
+            vcol2.metric("📈 VIX最大", f"{max(vix_values):.1f}")
+            vcol3.metric("📉 VIX最小", f"{min(vix_values):.1f}")
+            vcol4.metric("📋 データ日数", f"{len(vix_values)}日")
+        
+        st.caption("💡 VIXレジームにより自動でポジション調整が行われます。FEAR/PANICモードでは損失ポジションを強制売却します。")
+    
     st.divider()
     
     # 資産推移グラフ
@@ -1392,6 +1604,36 @@ if 'backtest_result' in st.session_state:
                           layer="below", line_width=0, row=1, col=1)
             fig.add_vrect(x0=start, x1=end, fillcolor="red", opacity=0.1, 
                           layer="below", line_width=0, row=2, col=1)
+    
+    # VIXレジーム期間を背景色で表示（v10.0新機能）
+    if 'vix_regime' in df_history.columns:
+        regime_colors = {
+            'CAUTION': ('yellow', 0.15),
+            'FEAR': ('orange', 0.2),
+            'PANIC': ('red', 0.3)
+        }
+        
+        for regime, (color, opacity) in regime_colors.items():
+            regime_periods = []
+            in_regime = False
+            start_date = None
+            
+            for i, row in df_history.iterrows():
+                if row.get('vix_regime') == regime and not in_regime:
+                    in_regime = True
+                    start_date = row['date']
+                elif row.get('vix_regime') != regime and in_regime:
+                    in_regime = False
+                    regime_periods.append((start_date, row['date']))
+            
+            if in_regime:
+                regime_periods.append((start_date, df_history['date'].iloc[-1]))
+            
+            for start, end in regime_periods:
+                fig.add_vrect(x0=start, x1=end, fillcolor=color, opacity=opacity, 
+                              layer="below", line_width=0, row=1, col=1,
+                              annotation_text=regime if (end - start).days > 3 else "",
+                              annotation_position="top left")
     
     # 総資産
     fig.add_trace(go.Scatter(
