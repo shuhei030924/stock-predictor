@@ -372,56 +372,6 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
     # ========== v7新規: レジーム調整後スコア ==========
     regime_adjusted_score = total_score * regime_buy_mult[regime]
     
-    # ========== v10.1: ADX（Average Directional Index）==========
-    # トレンドの強さを測定（25以上で強いトレンド）
-    plus_dm = df_slice['High'].diff()
-    minus_dm = -df_slice['Low'].diff()
-    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
-    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
-    
-    tr_14 = tr.rolling(window=14).sum()
-    plus_di = 100 * plus_dm.rolling(window=14).sum() / tr_14
-    minus_di = 100 * minus_dm.rolling(window=14).sum() / tr_14
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.001)
-    adx = dx.rolling(window=14).mean()
-    
-    adx_value = float(adx.iloc[-1]) if not pd.isna(adx.iloc[-1]) else 20.0
-    plus_di_value = float(plus_di.iloc[-1]) if not pd.isna(plus_di.iloc[-1]) else 25.0
-    minus_di_value = float(minus_di.iloc[-1]) if not pd.isna(minus_di.iloc[-1]) else 25.0
-    
-    # ADXシグナル: 強いトレンド + トレンド方向
-    adx_signal = 0.0
-    if adx_value >= 25:  # 強いトレンド
-        if plus_di_value > minus_di_value:
-            adx_signal = min(1.0, (adx_value - 25) / 25)  # 上昇トレンド
-        else:
-            adx_signal = max(-1.0, -(adx_value - 25) / 25)  # 下降トレンド
-    
-    # ========== v10.1: OBV（On Balance Volume）==========
-    # 出来高の累積で資金流入を追跡
-    obv = pd.Series(0, index=df_slice.index, dtype=float)
-    obv.iloc[0] = df_slice['Volume'].iloc[0]
-    for i in range(1, len(df_slice)):
-        if df_slice['Close'].iloc[i] > df_slice['Close'].iloc[i-1]:
-            obv.iloc[i] = obv.iloc[i-1] + df_slice['Volume'].iloc[i]
-        elif df_slice['Close'].iloc[i] < df_slice['Close'].iloc[i-1]:
-            obv.iloc[i] = obv.iloc[i-1] - df_slice['Volume'].iloc[i]
-        else:
-            obv.iloc[i] = obv.iloc[i-1]
-    
-    obv_sma = obv.rolling(window=20).mean()
-    obv_value = float(obv.iloc[-1])
-    obv_sma_value = float(obv_sma.iloc[-1]) if not pd.isna(obv_sma.iloc[-1]) else obv_value
-    
-    # OBVシグナル: OBVがSMAを上回っていれば買い圧力
-    obv_signal = 0.0
-    if obv_sma_value != 0:
-        obv_ratio = (obv_value - obv_sma_value) / abs(obv_sma_value)
-        obv_signal = max(-1.0, min(1.0, obv_ratio * 5))  # スケーリング
-    
-    # v10.1: ADX/OBVをスコアに追加
-    total_score += adx_signal * 0.1 + obv_signal * 0.1
-
     return {
         'price': current_price,
         'change': price_change,
@@ -448,13 +398,7 @@ def calculate_signal_at_date(df: pd.DataFrame, target_idx: int) -> dict:
         'early_warning_reasons': early_warning_reasons,
         'rsi_prev': rsi_prev,
         'macd_crossover': macd_crossover,
-        'hist_reversal': hist_reversal,
-        # v10.1: ADX/OBV
-        'adx': adx_value,
-        'plus_di': plus_di_value,
-        'minus_di': minus_di_value,
-        'adx_signal': adx_signal,
-        'obv_signal': obv_signal
+        'hist_reversal': hist_reversal
     }
 
 
@@ -563,22 +507,11 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         st.warning("市場データ(SPY)が取得できません。市場フィルターを無効化します。")
     
     # ========== v10.0: VIXデータ取得（レジーム検知用） ==========
-    # VIXは特殊なので、yfinanceから直接取得
-    import yfinance as yf
-    import requests
-    try:
-        session = requests.Session()
-        session.verify = False
-        vix_ticker = yf.Ticker("^VIX", session=session)
-        vix_data = vix_ticker.history(period="3y")
-        if vix_data is not None and len(vix_data) >= 50:
-            st.info(f"✅ VIXデータ取得成功（{len(vix_data)}日分） - 高度なレジーム検知を有効化")
-        else:
-            vix_data = None
-            st.warning("VIXデータが取得できません。VIXフィルターを無効化します。")
-    except Exception as e:
-        vix_data = None
-        st.warning(f"VIXデータ取得エラー: {e}。VIXフィルターを無効化します。")
+    vix_data = get_historical_data("^VIX", "3y")
+    if vix_data is None:
+        st.warning("VIXデータが取得できません。VIXフィルターを無効化します。")
+    else:
+        st.info("✅ VIXデータ取得成功 - 高度なレジーム検知を有効化")
     
     if not all_data:
         return {'error': f"データ不足の銘柄: {', '.join(failed_tickers)}", 'failed_tickers': failed_tickers}
@@ -663,14 +596,6 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
     
     # ========== v10.0: VIXレジーム履歴 ==========
     vix_regime_history = []  # VIXレジーム変化の追跡
-    
-    # ========== v10.1: ボラティリティターゲティング ==========
-    TARGET_ANNUAL_VOL = 0.15  # 目標年率ボラティリティ 15%
-    portfolio_returns_history = []  # 日次リターン履歴（20日分保持）
-    vol_scaling_factor = 1.0  # ボラティリティスケーリング係数
-    
-    # ========== v10.1: ADX/OBVインジケーター用キャッシュ ==========
-    indicator_cache = {}  # {ticker: {'adx': [], 'obv': [], 'obv_sma': []}}
     
     total_days = len(date_index)
     
@@ -763,30 +688,6 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         
         # ========== v10.0: 総合ポジション倍率（VIX × DD） ==========
         combined_position_multiplier = vix_position_multiplier * current_dd_multiplier
-        
-        # ========== v10.1: ボラティリティターゲティング ==========
-        # ポートフォリオの日次リターンを計算して履歴に追加
-        if len(history) >= 1:
-            prev_total = history[-1]['total_value']
-            daily_return = (total_value - prev_total) / prev_total if prev_total > 0 else 0
-            portfolio_returns_history.append(daily_return)
-            
-            # 直近20日のボラティリティを計算
-            if len(portfolio_returns_history) > 20:
-                portfolio_returns_history = portfolio_returns_history[-20:]
-            
-            if len(portfolio_returns_history) >= 10:
-                import numpy as np
-                realized_vol = np.std(portfolio_returns_history) * np.sqrt(252)  # 年率換算
-                
-                # ボラティリティスケーリング
-                if realized_vol > 0:
-                    vol_scaling_factor = min(2.0, max(0.3, TARGET_ANNUAL_VOL / realized_vol))
-                else:
-                    vol_scaling_factor = 1.0
-        
-        # v10.1: ボラティリティスケーリングを総合倍率に適用
-        combined_position_multiplier *= vol_scaling_factor
         
         # ========== 保有日数更新 ==========
         for ticker in portfolio:
@@ -1440,32 +1341,10 @@ else:
 st.sidebar.metric("選択銘柄数", len(selected_tickers))
 
 # アルゴリズム説明
-with st.expander("📋 売買アルゴリズム（改善版 v10.1 - VIX + VolTarget + ADX/OBV）", expanded=False):
+with st.expander("📋 売買アルゴリズム（改善版 v10.0 - VIXレジーム検知 + DD連動）", expanded=False):
     st.markdown("""
     ### ウォークフォワードテストとは
     各日の判断は**その日までのデータのみ**を使用し、未来のデータは一切見ません。
-    
-    ### 🆕 v10.1 新機能（Phase 2-3実装）
-    
-    #### 📊 ボラティリティターゲティング（v10.1 Phase 2）
-    ポートフォリオのボラティリティを目標値（年率15%）に維持：
-    - 実現ボラが高い → ポジション縮小
-    - 実現ボラが低い → ポジション拡大（最大2倍）
-    - 急変動期に自動でリスク調整
-    
-    #### 📈 ADX（Average Directional Index）（v10.1 Phase 3）
-    トレンドの強さを測定：
-    - ADX ≥ 25: 強いトレンド → トレンド方向に従う
-    - ADX < 25: レンジ相場 → 慎重運用
-    - +DI > -DI: 上昇トレンド → 買いボーナス
-    
-    #### 💰 OBV（On Balance Volume）（v10.1 Phase 3）
-    出来高の累積で機関投資家の資金流入を追跡：
-    - OBV > SMA(20): 資金流入 → 買いシグナル
-    - OBV < SMA(20): 資金流出 → 売りシグナル
-    - 価格とOBVの乖離はダイバージェンス
-    
-    ---
     
     ### 🆕 v10.0 新機能（Deep Research統合）
     
@@ -1491,7 +1370,12 @@ with st.expander("📋 売買アルゴリズム（改善版 v10.1 - VIX + VolTar
     | 3% ≤ DD < 5% | 50% | 半分に縮小 |
     | DD ≥ 5% | 25% | 75%縮小 |
     
-    **総合倍率 = VIX倍率 × DD倍率 × ボラ倍率**（全て適用）
+    **総合倍率 = VIX倍率 × DD倍率**（両方適用）
+    
+    #### 🎯 期待効果
+    - 3月型の急落: -3.71% → -1~2%に抑制
+    - シャープレシオ: 1.62 → 1.8~2.0
+    - 最大ドローダウン: 5.9% → 4%以下
     
     ---
     
