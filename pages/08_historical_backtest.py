@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import json
 from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -297,6 +298,88 @@ def precalculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def calculate_ai_scores(df: pd.DataFrame, interval: str = "1d") -> pd.Series:
+    """
+    Walk-Forward分析によるAIスコア算出 (Rolling Window)
+    過去データのみを使ってモデル学習し、未来を予測する
+    """
+    # 特徴量作成 (既存の指標を利用)
+    df_ai = df.copy()
+    
+    # 必要な列があるか確認
+    required_cols = ['Close', 'rsi', 'macd_hist']
+    if not all(col in df_ai.columns for col in required_cols):
+        return pd.Series(0.0, index=df.index)
+
+    df_ai['return_1d'] = df_ai['Close'].pct_change().fillna(0)
+    df_ai['volatility'] = df_ai['return_1d'].rolling(20).std().fillna(0)
+    df_ai['ma_ratio'] = (df_ai['Close'] / df_ai['Close'].rolling(50).mean()).fillna(1.0)
+    
+    # 目的変数: 5期間後のリターン (Swing Trade用)
+    # 学習時は shift(-5) で未来を見るが、予測時は直近データを使う
+    df_ai['target'] = df_ai['Close'].shift(-5) / df_ai['Close'] - 1
+    
+    features = ['return_1d', 'volatility', 'ma_ratio', 'rsi', 'macd_hist']
+    
+    # 欠損除去 (特徴量)
+    df_clean = df_ai.dropna(subset=features)
+    
+    # AIスコア格納用
+    ai_scores = pd.Series(0.0, index=df.index)
+    
+    # データが少なすぎる場合はスキップ
+    if len(df_clean) < 200:
+        return ai_scores
+        
+    # Rolling Window設定
+    # 1時間足ならデータが多いのでウィンドウも調整
+    train_window = 1000 if interval == "1h" else 250 # 1年分
+    update_step = 100 if interval == "1h" else 20 # 1ヶ月ごとに再学習
+    
+    model = RandomForestRegressor(n_estimators=20, max_depth=5, n_jobs=1, random_state=42)
+    
+    # Walk-Forward Loop
+    start_idx = train_window
+    
+    for i in range(start_idx, len(df_clean), update_step):
+        # 学習データ: 過去 train_window 分
+        train_data = df_clean.iloc[i-train_window:i]
+        
+        # ターゲットがNaN（直近5日など）の行は学習から除外
+        train_data_valid = train_data.dropna(subset=['target'])
+        
+        if len(train_data_valid) < 100:
+            continue
+            
+        X_train = train_data_valid[features]
+        y_train = train_data_valid['target']
+        
+        # モデル学習
+        try:
+            model.fit(X_train, y_train)
+            
+            # 予測期間: 次の update_step 分
+            end_idx = min(i + update_step, len(df_clean))
+            predict_data = df_clean.iloc[i:end_idx]
+            
+            if len(predict_data) == 0:
+                break
+                
+            X_pred = predict_data[features]
+            
+            # 予測実行
+            preds = model.predict(X_pred)
+            
+            # スコア格納
+            pred_indices = predict_data.index
+            ai_scores.loc[pred_indices] = preds
+            
+        except Exception:
+            continue
+            
+    return ai_scores
+
+
 def get_historical_data(ticker: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
     """
     過去データを取得（データベースキャッシュ優先）
@@ -362,7 +445,14 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                  start_days_ago: int = 504, progress_callback=None,
                  market_ticker: str = "SPY", interval: str = "1d") -> dict:
     """
-    過去2年間のバックテストを実行（改善版v10.9 - 長期データ＆利益追求）
+    過去2年間のバックテストを実行（改善版v11.0 - AIハイブリッド）
+    
+    v11.0 改善点（AI予測の導入）:
+    
+    【AIハイブリッド判定】
+    - Walk-Forward分析: 過去データのみで学習したRandomForestモデルが、未来の収益を予測
+    - AIスコアフィルタ: テクニカル的に買いでも、AIが「下落」と予測した場合はエントリーを見送り
+    - これにより「ダマシ」を回避し、勝率をさらに向上させる
     
     v10.9 改善点（データ増量と利益最大化）:
     
@@ -451,11 +541,30 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
     if not all_data:
         return {'error': f"データ不足の銘柄: {', '.join(failed_tickers)}", 'failed_tickers': failed_tickers}
     
-    # ========== 高速化: 指標一括計算 ==========
-    st.info("指標を一括計算中...")
+    # ========== 高速化: 指標一括計算 & AI予測 ==========
+    st.info("指標計算 & AI予測モデル学習中 (Walk-Forward)...")
     precalculated_data = {}
-    for ticker, df in all_data.items():
-        precalculated_data[ticker] = precalculate_indicators(df)
+    
+    # プログレスバー
+    prog_bar = st.progress(0)
+    total_tickers = len(all_data)
+    
+    for i, (ticker, df) in enumerate(all_data.items()):
+        # テクニカル指標
+        df_calc = precalculate_indicators(df)
+        
+        # AIスコア (v11.0)
+        # データ量が多いと時間がかかるので、ステータス表示
+        if progress_callback:
+            progress_callback((i / total_tickers), f"{ticker}: AIモデル学習中...")
+        
+        ai_scores = calculate_ai_scores(df_calc, interval=interval)
+        df_calc['ai_score'] = ai_scores
+        
+        precalculated_data[ticker] = df_calc
+        prog_bar.progress((i + 1) / total_tickers)
+        
+    prog_bar.empty()
 
     # ========== v7新規: セクター情報（簡易版） ==========
     # 銘柄コードから簡易セクター推定（日本株は4桁コード）
@@ -1062,6 +1171,20 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             if score < min_buy_score:
                 continue
             
+            # ========== v11.0: AIスコアフィルター ==========
+            # テクニカル的に買いでも、AIが下落を予測している場合は見送り
+            ai_score = signal.get('ai_score', 0.0)
+            
+            # AIが強い下落(-1%以下)を予測している場合
+            if ai_score < -0.01:
+                # ただし、テクニカルスコアが非常に高い(0.8以上)場合はAIを無視して勝負
+                if score < 0.8:
+                    continue
+            
+            # AIが上昇(+1%以上)を予測している場合はスコア加点
+            if ai_score > 0.01:
+                score += 0.1
+            
             # 条件2: 銘柄自体が上昇トレンド（50日MA > 200日MA）
             # v10.8: 非常に強いシグナル（スコア0.7以上）ならトレンド無視して逆張り可 (0.6 -> 0.7)
             if not is_uptrend and score < 0.7:
@@ -1489,9 +1612,12 @@ if st.button("🚀 バックテスト実行", type="primary", use_container_widt
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        def update_progress(p):
+        def update_progress(p, msg=None):
             progress_bar.progress(p)
-            status_text.text(f"処理中... {int(p * 100)}%")
+            if msg:
+                status_text.text(msg)
+            else:
+                status_text.text(f"処理中... {int(p * 100)}%")
         
         status_text.text("過去データを取得中...")
         
