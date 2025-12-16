@@ -7,10 +7,15 @@ import numpy as np
 from datetime import datetime
 from collections import defaultdict
 
-def analyze_backtest_results(history: list, trades: list, initial_cash: float = 1000000):
+def analyze_backtest_results(history: list, trades: list, initial_cash: float = 1000000, interval: str = "1d"):
     """バックテスト結果を詳細に分析"""
     
     results = {}
+    
+    # 年率換算係数
+    annual_factor = 252
+    if interval == "1h":
+        annual_factor = 252 * 7  # 1日7時間と仮定
     
     # ==================== 基本統計 ====================
     df_history = pd.DataFrame(history)
@@ -28,7 +33,7 @@ def analyze_backtest_results(history: list, trades: list, initial_cash: float = 
         '最終資産': f"¥{final_value:,.0f}",
         '損益': f"¥{final_value - initial_value:,.0f}",
         '総収益率': f"{total_return:.2f}%",
-        '年率換算': f"{total_return * 252 / len(df_history):.2f}%",
+        '年率換算': f"{total_return * annual_factor / len(df_history):.2f}%",
         '取引日数': len(df_history),
     }
     
@@ -40,11 +45,11 @@ def analyze_backtest_results(history: list, trades: list, initial_cash: float = 
     
     # ボラティリティ
     daily_vol = df_history['daily_return'].std()
-    annual_vol = daily_vol * np.sqrt(252)
+    annual_vol = daily_vol * np.sqrt(annual_factor)
     
     # シャープレシオ（無リスク金利0%と仮定）
     avg_daily_return = df_history['daily_return'].mean()
-    sharpe_ratio = (avg_daily_return * 252) / annual_vol if annual_vol > 0 else 0
+    sharpe_ratio = (avg_daily_return * annual_factor) / annual_vol if annual_vol > 0 else 0
     
     # 勝ち日数 vs 負け日数
     winning_days = (df_history['daily_return'] > 0).sum()
