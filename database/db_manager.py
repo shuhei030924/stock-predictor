@@ -65,6 +65,22 @@ class DatabaseManager:
                 UNIQUE(ticker, date)
             )
         """)
+
+        # 1時間足キャッシュテーブル
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS price_cache_1h (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker TEXT NOT NULL,
+                datetime TIMESTAMP NOT NULL,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume INTEGER,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(ticker, datetime)
+            )
+        """)
         
         # 予測履歴テーブル
         cursor.execute("""
@@ -178,6 +194,8 @@ class DatabaseManager:
         # インデックス作成
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_ticker ON price_cache(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_date ON price_cache(date)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_1h_ticker ON price_cache_1h(ticker)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_price_cache_1h_datetime ON price_cache_1h(datetime)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_prediction_ticker ON prediction_history(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_ticker ON portfolio(ticker)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_alerts_ticker ON alerts(ticker)")
@@ -383,6 +401,68 @@ class DatabaseManager:
         last_update = datetime.fromisoformat(row['last_update'])
         return (datetime.now() - last_update).total_seconds() < max_age_hours * 3600
     
+    # ==================== 1時間足キャッシュ操作 ====================
+
+    def cache_prices_1h(self, ticker: str, df: pd.DataFrame) -> int:
+        """1時間足データをキャッシュ"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        count = 0
+        
+        try:
+            for dt, row in df.iterrows():
+                # datetime型を文字列に変換
+                dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                cursor.execute("""
+                    INSERT OR REPLACE INTO price_cache_1h 
+                    (ticker, datetime, open, high, low, close, volume, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (
+                    ticker.upper(),
+                    dt_str,
+                    float(row['Open']),
+                    float(row['High']),
+                    float(row['Low']),
+                    float(row['Close']),
+                    int(row['Volume'])
+                ))
+                count += 1
+            conn.commit()
+        except Exception as e:
+            print(f"Error caching 1h prices: {e}")
+        finally:
+            conn.close()
+        
+        return count
+
+    def get_cached_prices_1h(self, ticker: str, days: int = 730) -> Optional[pd.DataFrame]:
+        """キャッシュから1時間足データを取得"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        since_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        
+        cursor.execute("""
+            SELECT datetime, open, high, low, close, volume
+            FROM price_cache_1h
+            WHERE ticker = ? AND datetime >= ?
+            ORDER BY datetime
+        """, (ticker.upper(), since_date))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if not rows:
+            return None
+        
+        df = pd.DataFrame([dict(row) for row in rows])
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df.set_index('datetime', inplace=True)
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        
+        return df
+
     # ==================== 予測履歴操作 ====================
     
     def save_prediction(self, ticker: str, prediction_date: str, 

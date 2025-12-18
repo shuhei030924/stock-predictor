@@ -506,7 +506,7 @@ st.markdown("""
 @st.cache_resource
 def load_database():
     try:
-        from database import get_db
+        from database.db_manager import get_db
         return get_db(), True
     except ImportError:
         return None, False

@@ -13,12 +13,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
 import json
 from pathlib import Path
-from sklearn.ensemble import RandomForestRegressor
+# from sklearn.ensemble import RandomForestRegressor
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from database.db_manager import DatabaseManager
 from analysis.backtest_analyzer import analyze_backtest_results, print_analysis
+from services.market_rules import get_price_limits
+from models.lgbm_model import StockPredictorLGBM
+from models.xgb_model import StockPredictorXGB
 
 st.set_page_config(
     page_title="📅 過去1年バックテスト",
@@ -27,14 +30,14 @@ st.set_page_config(
 )
 
 st.title("📅 過去1年間バックテスト")
-st.markdown("**v10.7** - 積極的スケーリング (取引頻度向上 + 収益最大化)")
+st.markdown("**v11.0** - AIハイブリッド + 市場微細構造シミュレーション")
 
 db = DatabaseManager()
 
 
 # ==================== シグナル計算関数（特定日時点） ====================
 
-def precalculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def precalculate_indicators(df: pd.DataFrame, interval: str = "1d") -> pd.DataFrame:
     """
     全期間の指標を一括計算（ベクトル化高速版）
     """
@@ -50,6 +53,37 @@ def precalculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     high = df['High']
     low = df['Low']
     volume = df['Volume']
+
+    # ========== 値幅制限 (Stop High/Low) ==========
+    # 前日終値を取得
+    if interval == "1h":
+        # 1時間足の場合、日付ごとの終値を取得してシフト
+        # indexがdatetimeであることを前提
+        if not pd.api.types.is_datetime64_any_dtype(df.index):
+             df.index = pd.to_datetime(df.index)
+             
+        temp_date = df.index.date
+        temp_df = pd.DataFrame({'Close': df['Close'], 'date': temp_date})
+        daily_closes = temp_df.groupby('date')['Close'].last()
+        prev_daily_closes = daily_closes.shift(1)
+        
+        # マージして前日終値をセット
+        df['prev_day_close'] = pd.Series(temp_date, index=df.index).map(prev_daily_closes)
+    else:
+        # 日足の場合、単純に1つ前
+        df['prev_day_close'] = df['Close'].shift(1)
+        
+    # 値幅制限を計算 (ユニークな価格に対して計算してマップすることで高速化)
+    unique_prices = df['prev_day_close'].dropna().unique()
+    # get_price_limitsは軽量なのでループでもOKだが、念のため
+    limit_map = {p: get_price_limits(p) for p in unique_prices}
+    
+    # マップ適用
+    limits = df['prev_day_close'].map(limit_map)
+    
+    # 分割して列に (NaNの場合はNaN)
+    df['stop_low'] = limits.apply(lambda x: x[0] if isinstance(x, tuple) else np.nan)
+    df['stop_high'] = limits.apply(lambda x: x[1] if isinstance(x, tuple) else np.nan)
     
     # ========== RSI (14日) ==========
     delta = close.diff()
@@ -298,28 +332,51 @@ def precalculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def calculate_ai_scores(df: pd.DataFrame, interval: str = "1d") -> pd.Series:
+def calculate_ai_scores(df: pd.DataFrame, interval: str = "1d", use_gpu: bool = False) -> pd.Series:
     """
-    Walk-Forward分析によるAIスコア算出 (Rolling Window)
+    Walk-Forward分析によるAIスコア算出 (XGBoost GPU + Purged CV)
     過去データのみを使ってモデル学習し、未来を予測する
+    RTX 5070 + CUDA 13 + XGBoost で高速GPU学習
     """
     # 特徴量作成 (既存の指標を利用)
     df_ai = df.copy()
     
     # 必要な列があるか確認
-    required_cols = ['Close', 'rsi', 'macd_hist']
+    required_cols = ['Close', 'High', 'Low', 'Volume', 'rsi', 'macd_hist']
     if not all(col in df_ai.columns for col in required_cols):
         return pd.Series(0.0, index=df.index)
 
+    # 1. 基本リターン系
     df_ai['return_1d'] = df_ai['Close'].pct_change().fillna(0)
-    df_ai['volatility'] = df_ai['return_1d'].rolling(20).std().fillna(0)
+    df_ai['return_5d'] = df_ai['Close'].pct_change(5).fillna(0)
+    
+    # 2. ボラティリティ系
+    df_ai['volatility_20d'] = df_ai['return_1d'].rolling(20).std().fillna(0)
+    df_ai['volatility_60d'] = df_ai['return_1d'].rolling(60).std().fillna(0)
+    df_ai['vol_ratio'] = (df_ai['volatility_20d'] / df_ai['volatility_60d'].replace(0, 1)).fillna(1.0)
+    
+    # 3. トレンド・位置系
     df_ai['ma_ratio'] = (df_ai['Close'] / df_ai['Close'].rolling(50).mean()).fillna(1.0)
+    df_ai['dist_from_high_20d'] = (df_ai['High'].rolling(20).max() - df_ai['Close']) / df_ai['Close']
+    df_ai['dist_from_low_20d'] = (df_ai['Close'] - df_ai['Low'].rolling(20).min()) / df_ai['Close']
+    
+    # 4. 出来高系
+    df_ai['volume_ma_ratio'] = (df_ai['Volume'] / df_ai['Volume'].rolling(20).mean().replace(0, 1)).fillna(1.0)
+    
+    # 5. テクニカル指標 (既存)
+    # rsi, macd_hist は既に計算済み
     
     # 目的変数: 5期間後のリターン (Swing Trade用)
-    # 学習時は shift(-5) で未来を見るが、予測時は直近データを使う
-    df_ai['target'] = df_ai['Close'].shift(-5) / df_ai['Close'] - 1
+    prediction_horizon = 5
+    df_ai['target'] = df_ai['Close'].shift(-prediction_horizon) / df_ai['Close'] - 1
     
-    features = ['return_1d', 'volatility', 'ma_ratio', 'rsi', 'macd_hist']
+    features = [
+        'return_1d', 'return_5d', 
+        'volatility_20d', 'vol_ratio', 
+        'ma_ratio', 'dist_from_high_20d', 'dist_from_low_20d',
+        'volume_ma_ratio',
+        'rsi', 'macd_hist'
+    ]
     
     # 欠損除去 (特徴量)
     df_clean = df_ai.dropna(subset=features)
@@ -334,25 +391,48 @@ def calculate_ai_scores(df: pd.DataFrame, interval: str = "1d") -> pd.Series:
     # Rolling Window設定
     # 1時間足ならデータが多いのでウィンドウも調整
     train_window = 1000 if interval == "1h" else 250 # 1年分
-    update_step = 100 if interval == "1h" else 20 # 1ヶ月ごとに再学習
+    # 高速化: 学習頻度を下げる（精度と速度のバランス）
+    update_step = 200 if interval == "1h" else 50 # 高速化: 学習頻度DOWN
     
-    model = RandomForestRegressor(n_estimators=20, max_depth=5, n_jobs=1, random_state=42)
+    # モデル初期化 (XGBoost GPU - CUDA 13 / RTX 5070対応)
+    model = StockPredictorXGB(use_gpu=use_gpu)
     
     # Walk-Forward Loop
     start_idx = train_window
     
+    # データフレームのコピーを避けるため、必要なデータだけ抽出
+    X_all = df_clean[features].values
+    y_all = df_clean['target'].values
+    indices = df_clean.index
+    
+    # ループ回数を減らすためにバッチ処理的に予測を行う
+    # しかしWalk-Forwardなので学習は毎回必要
+    # 高速化: 学習頻度を下げる (update_stepを大きくする)
+    
     for i in range(start_idx, len(df_clean), update_step):
         # 学習データ: 過去 train_window 分
-        train_data = df_clean.iloc[i-train_window:i]
+        # 【重要】Purging: リークを防ぐため、直近 prediction_horizon 分のデータは学習に使わない
+        train_end_idx = i - prediction_horizon
         
-        # ターゲットがNaN（直近5日など）の行は学習から除外
-        train_data_valid = train_data.dropna(subset=['target'])
-        
-        if len(train_data_valid) < 100:
+        if train_end_idx < train_window:
             continue
             
-        X_train = train_data_valid[features]
-        y_train = train_data_valid['target']
+        # ウィンドウの開始位置も調整（常に train_window 分の長さを維持する場合）
+        train_start_idx = max(0, train_end_idx - train_window)
+        
+        # numpy配列を使ってスライス (高速化)
+        X_train = X_all[train_start_idx : train_end_idx]
+        y_train = y_all[train_start_idx : train_end_idx]
+        
+        # ターゲットがNaNの行は学習から除外 (numpyでの処理は複雑になるので、事前にdropna済みと仮定)
+        # df_clean作成時にdropna(subset=features)しているが、targetのNaNは残っている可能性がある
+        # targetのNaNチェック
+        valid_mask = ~np.isnan(y_train)
+        if np.sum(valid_mask) < 100:
+            continue
+            
+        X_train = X_train[valid_mask]
+        y_train = y_train[valid_mask]
         
         # モデル学習
         try:
@@ -360,19 +440,23 @@ def calculate_ai_scores(df: pd.DataFrame, interval: str = "1d") -> pd.Series:
             
             # 予測期間: 次の update_step 分
             end_idx = min(i + update_step, len(df_clean))
-            predict_data = df_clean.iloc[i:end_idx]
             
-            if len(predict_data) == 0:
+            # 予測用データ
+            X_pred = X_all[i:end_idx]
+            
+            if len(X_pred) == 0:
                 break
                 
-            X_pred = predict_data[features]
-            
             # 予測実行
             preds = model.predict(X_pred)
             
             # スコア格納
-            pred_indices = predict_data.index
-            ai_scores.loc[pred_indices] = preds
+            # locを使うと遅いので、あとでまとめて格納するか、ilocを使う
+            # ここではSeriesのiloc更新ができないので、一時リストに保存するか、
+            # 元のdfのindexを使ってloc更新するが、頻度を下げたので許容範囲か
+            
+            current_indices = indices[i:end_idx]
+            ai_scores.loc[current_indices] = preds
             
         except Exception:
             continue
@@ -391,8 +475,18 @@ def get_historical_data(ticker: str, period: str = "2y", interval: str = "1d") -
     }
     days = period_days.get(period, 730)
     
-    # 1時間足の場合はキャッシュを使わず直接取得（DBが日足前提のため）
+    # 1時間足の場合
     if interval == "1h":
+        # まずデータベースから取得を試みる (1時間足キャッシュ)
+        df = db.get_cached_prices_1h(ticker, days=days)
+        
+        if df is not None and len(df) >= 50:
+            # 最新データかどうかチェック（簡易的に最終日時で判断）
+            last_date = df.index[-1]
+            if (datetime.now() - last_date).days < 2: # 2日以内ならOKとする
+                return df
+        
+        # キャッシュがない、または古い場合はyfinanceから取得
         import time
         time.sleep(0.3)
         try:
@@ -403,12 +497,19 @@ def get_historical_data(ticker: str, period: str = "2y", interval: str = "1d") -
                 period = "2y"
             df = stock.history(period=period, interval=interval)
             if df is not None and len(df) >= 50:
+                # タイムゾーンを除去（SQLite保存用）
+                if df.index.tz is not None:
+                    df.index = df.index.tz_localize(None)
+                
+                # DBにキャッシュ
+                db.cache_prices_1h(ticker, df)
                 return df
             return None
         except Exception as e:
             st.warning(f"{ticker}: 1時間足データ取得エラー: {e}")
             return None
 
+    # 日足の場合
     # まずデータベースから取得を試みる
     df = db.get_cached_prices(ticker, days=days)
     
@@ -443,7 +544,8 @@ def get_historical_data(ticker: str, period: str = "2y", interval: str = "1d") -
 
 def run_backtest(tickers: list, initial_cash: float = 1000000, 
                  start_days_ago: int = 504, progress_callback=None,
-                 market_ticker: str = "SPY", interval: str = "1d") -> dict:
+                 market_ticker: str = "SPY", interval: str = "1d",
+                 slippage: float = 0.001, use_gpu: bool = False) -> dict:
     """
     過去2年間のバックテストを実行（改善版v11.0 - AIハイブリッド）
     
@@ -542,28 +644,68 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         return {'error': f"データ不足の銘柄: {', '.join(failed_tickers)}", 'failed_tickers': failed_tickers}
     
     # ========== 高速化: 指標一括計算 & AI予測 ==========
-    st.info("指標計算 & AI予測モデル学習中 (Walk-Forward)...")
-    precalculated_data = {}
-    
-    # プログレスバー
-    prog_bar = st.progress(0)
+    gpu_info = "XGBoost CUDA (RTX 5070)" if use_gpu else "CPU"
     total_tickers = len(all_data)
     
-    for i, (ticker, df) in enumerate(all_data.items()):
-        # テクニカル指標
-        df_calc = precalculate_indicators(df)
+    # 統合プログレス表示（1つのバー + ステータス）
+    progress_container = st.container()
+    with progress_container:
+        prog_bar = st.progress(0)
+        status_text = st.empty()
+    
+    import time as time_module
+    start_time = time_module.time()
+    
+    def update_progress(current, total, phase, ticker=""):
+        """進捗更新: パーセント表示 + 残り時間予測"""
+        progress = current / total if total > 0 else 0
+        prog_bar.progress(progress)
         
-        # AIスコア (v11.0)
-        # データ量が多いと時間がかかるので、ステータス表示
-        if progress_callback:
-            progress_callback((i / total_tickers), f"{ticker}: AIモデル学習中...")
+        elapsed = time_module.time() - start_time
+        if current > 0:
+            remaining = (elapsed / current) * (total - current)
+            eta_min = int(remaining // 60)
+            eta_sec = int(remaining % 60)
+            eta_str = f"{eta_min}分{eta_sec}秒" if eta_min > 0 else f"{eta_sec}秒"
+        else:
+            eta_str = "計算中..."
         
-        ai_scores = calculate_ai_scores(df_calc, interval=interval)
+        status_text.markdown(f"**{phase}** | {ticker} | 進捗: **{progress*100:.1f}%** ({current}/{total}) | 残り: **{eta_str}** | [{gpu_info}]")
+    
+    precalculated_data = {}
+    
+    # Step 1: テクニカル指標を並列計算（CPU並列で高速化）
+    def calc_indicators(item):
+        ticker, df = item
+        return ticker, precalculate_indicators(df, interval=interval)
+    
+    indicator_results = {}
+    update_progress(0, total_tickers, "📊 指標計算", "準備中...")
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(calc_indicators, item): item[0] for item in all_data.items()}
+        completed = 0
+        for future in as_completed(futures):
+            ticker, df_calc = future.result()
+            indicator_results[ticker] = df_calc
+            completed += 1
+            update_progress(completed, total_tickers * 2, "📊 指標計算", ticker)
+    
+    # Step 2: AI学習は順次処理（GPUは1つなので）
+    for i, ticker in enumerate(indicator_results.keys()):
+        df_calc = indicator_results[ticker]
+        
+        update_progress(total_tickers + i, total_tickers * 2, "🤖 AI学習", ticker)
+        
+        ai_scores = calculate_ai_scores(df_calc, interval=interval, use_gpu=use_gpu)
         df_calc['ai_score'] = ai_scores
         
         precalculated_data[ticker] = df_calc
-        prog_bar.progress((i + 1) / total_tickers)
-        
+    
+    # 完了表示
+    update_progress(total_tickers * 2, total_tickers * 2, "✅ 完了", "")
+    elapsed_total = time_module.time() - start_time
+    status_text.markdown(f"✅ **AI学習完了** | {total_tickers}銘柄 | 所要時間: **{elapsed_total:.1f}秒** | [{gpu_info}]")
     prog_bar.empty()
 
     # ========== v7新規: セクター情報（簡易版） ==========
@@ -735,9 +877,11 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             
             signal = {
                 'price': float(row['Close']),
+                'volume': float(row['Volume']) if not pd.isna(row['Volume']) else 0.0,
                 'change': float(row['price_change']) if not pd.isna(row['price_change']) else 0.0,
                 'rsi': float(row['rsi']) if not pd.isna(row['rsi']) else 50.0,
                 'total_score': float(row['total_score']) if not pd.isna(row['total_score']) else 0.0,
+                'ai_score': float(row['ai_score']) if not pd.isna(row['ai_score']) else 0.0,
                 'is_uptrend': bool(row['is_uptrend']) if not pd.isna(row['is_uptrend']) else True,
                 'atr_pct': float(row['atr_pct']) if not pd.isna(row['atr_pct']) else 2.0,
                 'bb_position': float(row['bb_position']) if not pd.isna(row['bb_position']) else 0.5,
@@ -757,7 +901,9 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                 'early_warning_reasons': [], # 高速化のため省略
                 'rsi_prev': float(df['rsi'].iloc[idx_loc-1]) if idx_loc > 0 and not pd.isna(df['rsi'].iloc[idx_loc-1]) else 50.0,
                 'macd_crossover': int(row['macd_crossover']) if not pd.isna(row['macd_crossover']) else 0,
-                'hist_reversal': int(row['hist_reversal']) if not pd.isna(row['hist_reversal']) else 0
+                'hist_reversal': int(row['hist_reversal']) if not pd.isna(row['hist_reversal']) else 0,
+                'stop_low': float(row['stop_low']) if not pd.isna(row['stop_low']) else 0.0,
+                'stop_high': float(row['stop_high']) if not pd.isna(row['stop_high']) else float('inf')
             }
             
             daily_signals[ticker] = signal
@@ -798,6 +944,12 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             for ticker in list(portfolio.keys()):
                 if ticker not in daily_prices:
                     continue
+                
+                # ストップ安チェック (v12.0)
+                stop_low = daily_signals[ticker].get('stop_low', 0.0)
+                if daily_prices[ticker] <= stop_low * 1.0001:
+                    continue
+                
                 pos = portfolio[ticker]
                 price = daily_prices[ticker]
                 pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100
@@ -819,7 +971,8 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                         sell_reason = f"VIX FEAR利確50% (VIX:{vix_level:.1f}, PnL:{pnl_rate:.1f}%)"
                 
                 if sell_shares > 0:
-                    amount = sell_shares * price
+                    execution_price = price * (1 - slippage)
+                    amount = sell_shares * execution_price
                     cash += amount
                     
                     trades.append({
@@ -827,7 +980,7 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                         'ticker': ticker,
                         'action': 'SELL',
                         'shares': sell_shares,
-                        'price': price,
+                        'price': execution_price,
                         'amount': amount,
                         'reason': sell_reason,
                         'pnl_rate': pnl_rate,
@@ -853,6 +1006,12 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             for ticker in list(portfolio.keys()):
                 if ticker not in daily_prices:
                     continue
+                
+                # ストップ安チェック (v12.0)
+                stop_low = daily_signals[ticker].get('stop_low', 0.0)
+                if daily_prices[ticker] <= stop_low * 1.0001:
+                    continue
+                
                 pos = portfolio[ticker]
                 price = daily_prices[ticker]
                 pnl_rate = ((price - pos['avg_cost']) / pos['avg_cost']) * 100
@@ -872,7 +1031,8 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     sell_reason = f"弱気相場損切り ({pnl_rate:.1f}%)"
                 
                 if sell_shares > 0:
-                    amount = sell_shares * price
+                    execution_price = price * (1 - slippage)
+                    amount = sell_shares * execution_price
                     cash += amount
                     
                     trades.append({
@@ -880,7 +1040,7 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                         'ticker': ticker,
                         'action': 'SELL',
                         'shares': sell_shares,
-                        'price': price,
+                        'price': execution_price,
                         'amount': amount,
                         'reason': sell_reason,
                         'pnl_rate': pnl_rate
@@ -901,6 +1061,11 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         # ========== 売り処理（先に実行） ==========
         for ticker in list(portfolio.keys()):
             if ticker not in daily_signals or ticker not in daily_prices:
+                continue
+            
+            # ストップ安チェック (v12.0)
+            stop_low = daily_signals[ticker].get('stop_low', 0.0)
+            if daily_prices[ticker] <= stop_low * 1.0001:
                 continue
             
             pos = portfolio[ticker]
@@ -1027,7 +1192,8 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             
             if sell_ratio > 0:
                 shares_to_sell = pos['shares'] * sell_ratio
-                amount = shares_to_sell * price
+                execution_price = price * (1 - slippage)
+                amount = shares_to_sell * execution_price
                 cash += amount
                 
                 # ========== v6新規: 拡張実績トラッキング ==========
@@ -1059,7 +1225,7 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     'ticker': ticker,
                     'action': 'SELL',
                     'shares': shares_to_sell,
-                    'price': price,
+                    'price': execution_price,
                     'amount': amount,
                     'reason': sell_reason,
                     'pnl_rate': pnl_rate
@@ -1100,6 +1266,11 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                 if ticker not in daily_signals:
                     continue
                 
+                # ストップ高チェック (v12.0)
+                stop_high = daily_signals[ticker].get('stop_high', float('inf'))
+                if daily_prices.get(ticker, 0) >= stop_high * 0.999:
+                    continue
+                
                 pos = portfolio[ticker]
                 signal = daily_signals[ticker]
                 price = daily_prices.get(ticker, pos['avg_cost'])
@@ -1134,12 +1305,13 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                         # 買い増し額: 総資産の7%
                         add_amount = min(current_total * 0.07, cash - current_total * 0.08)
                         if add_amount > 15000:  # 最低1.5万円以上
-                            add_shares = add_amount / price
+                            execution_price = price * (1 + slippage)
+                            add_shares = add_amount / execution_price
                             cash -= add_amount
                             
                             # 平均コストを更新
                             total_shares = pos['shares'] + add_shares
-                            new_avg_cost = (pos['shares'] * pos['avg_cost'] + add_shares * price) / total_shares
+                            new_avg_cost = (pos['shares'] * pos['avg_cost'] + add_shares * execution_price) / total_shares
                             portfolio[ticker]['shares'] = total_shares
                             portfolio[ticker]['avg_cost'] = new_avg_cost
                             
@@ -1148,7 +1320,7 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                                 'ticker': ticker,
                                 'action': 'BUY',
                                 'shares': add_shares,
-                                'price': price,
+                                'price': execution_price,
                                 'amount': add_amount,
                                 'reason': f"買い増し (利益{pnl_rate:.1f}%, 勝率{perf['wins']/perf['trade_count']*100:.0f}%)"
                             })
@@ -1157,6 +1329,16 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
         buy_candidates = []
         for ticker, signal in daily_signals.items():
             if ticker in portfolio:  # 既存ポジションは買い増しで対応済み
+                continue
+            
+            # ストップ高チェック (v12.0)
+            stop_high = signal.get('stop_high', float('inf'))
+            if signal['price'] >= stop_high * 0.999:
+                continue
+            
+            # 流動性チェック (v12.0)
+            trading_value = signal.get('volume', 0) * signal['price']
+            if trading_value < 5000000: # 500万円未満は除外
                 continue
             
             score = signal['total_score']
@@ -1378,13 +1560,14 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
             
             # ========== v7.0: 最低購入額 ==========
             if buy_amount > 50000:  # 5万円以上のみ購入
-                shares = buy_amount / price
+                execution_price = price * (1 + slippage)
+                shares = buy_amount / execution_price
                 cash -= buy_amount
                 
                 portfolio[ticker] = {
                     'shares': shares,
-                    'avg_cost': price,
-                    'high_since_buy': price,
+                    'avg_cost': execution_price,
+                    'high_since_buy': execution_price,
                     'buy_date': current_date,
                     'days_held': 0,
                     'last_partial_sell_day': 0
@@ -1406,7 +1589,7 @@ def run_backtest(tickers: list, initial_cash: float = 1000000,
                     'ticker': ticker,
                     'action': 'BUY',
                     'shares': shares,
-                    'price': price,
+                    'price': execution_price,
                     'amount': buy_amount,
                     'reason': f"買い (S{score:.2f}{big_win_info}{momentum_info}{kelly_info}{squeeze_info}, {regime_name})"
                 })
@@ -1601,9 +1784,16 @@ with st.expander("📋 売買アルゴリズム（改善版 v10.5 - 集中投資
 # バックテスト実行
 st.divider()
 
-# 時間足選択
-interval_option = st.radio("時間足を選択", ["日足 (1d)", "1時間足 (1h)"], index=0, horizontal=True)
-interval = "1d" if "1d" in interval_option else "1h"
+col1, col2 = st.columns(2)
+
+with col1:
+    # 時間足選択
+    interval_option = st.radio("時間足を選択", ["日足 (1d)", "1時間足 (1h)"], index=0, horizontal=True)
+    interval = "1d" if "1d" in interval_option else "1h"
+
+with col2:
+    # GPU設定 (RTX 5070 + CUDA 13 + XGBoost)
+    use_gpu = st.checkbox("GPUを使用する (XGBoost CUDA)", value=True, help="RTX 5070 + CUDA 13対応。XGBoostでGPU学習を高速化します。")
 
 if st.button("🚀 バックテスト実行", type="primary", use_container_width=True):
     if len(selected_tickers) == 0:
@@ -1627,7 +1817,8 @@ if st.button("🚀 バックテスト実行", type="primary", use_container_widt
                 initial_cash=initial_cash,
                 start_days_ago=test_days,
                 progress_callback=update_progress,
-                interval=interval
+                interval=interval,
+                use_gpu=use_gpu
             )
         
         progress_bar.empty()
