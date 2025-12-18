@@ -25,6 +25,10 @@ arch>=6.0.0
 # Webアプリ
 streamlit>=1.20.0
 
+# 通知・環境変数
+requests>=2.25.0
+python-dotenv>=1.0.0
+
 # 深層学習 (GPU対応)
 # RTX 5070 (Blackwell) 対応には CUDA 13 + PyTorch 2.9以降が必要:
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu130
