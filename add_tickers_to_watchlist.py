@@ -83,7 +83,7 @@ TICKERS_TO_ADD = {
     "6963.T": {"name": "ローム", "sector": "半導体", "market": "東証プライム"},
     "4684.T": {"name": "オービック", "sector": "IT", "market": "東証プライム"},
     "4307.T": {"name": "野村総合研究所", "sector": "IT", "market": "東証プライム"},
-    "9613.T": {"name": "NTTデータグループ", "sector": "IT", "market": "東証プライム"},
+    # 9613.T (NTTデータ) - 上場廃止のため削除
     "4751.T": {"name": "サイバーエージェント", "sector": "IT", "market": "東証プライム"},
     "4755.T": {"name": "楽天グループ", "sector": "IT", "market": "東証プライム"},
     "3659.T": {"name": "ネクソン", "sector": "ゲーム", "market": "東証プライム"},
@@ -111,7 +111,7 @@ TICKERS_TO_ADD = {
     "7182.T": {"name": "ゆうちょ銀行", "sector": "銀行", "market": "東証プライム"},
     "8354.T": {"name": "ふくおかフィナンシャルグループ", "sector": "銀行", "market": "東証プライム"},
     "8331.T": {"name": "千葉銀行", "sector": "銀行", "market": "東証プライム"},
-    "8355.T": {"name": "静岡銀行", "sector": "銀行", "market": "東証プライム"},
+    # 8355.T (静岡銀行) - Yahoo Financeでデータ取得不可のため削除
     "7186.T": {"name": "コンコルディア・フィナンシャルグループ", "sector": "銀行", "market": "東証プライム"},
     
     # ==================== 日本株_自動車15 ====================
@@ -143,7 +143,7 @@ TICKERS_TO_ADD = {
     "8252.T": {"name": "丸井グループ", "sector": "小売", "market": "東証プライム"},
     "2670.T": {"name": "ABCマート", "sector": "小売", "market": "東証プライム"},
     "7532.T": {"name": "パン・パシフィック・インターナショナル", "sector": "小売", "market": "東証プライム"},
-    "2651.T": {"name": "ローソン", "sector": "小売", "market": "東証プライム"},
+    # 2651.T (ローソン) - 2024年7月上場廃止のため削除
     
     # ==================== 日本株_医薬15 ====================
     "4519.T": {"name": "中外製薬", "sector": "医薬品", "market": "東証プライム"},
@@ -248,7 +248,7 @@ TICKERS_TO_ADD = {
     "DDOG": {"name": "Datadog Inc.", "sector": "Technology", "market": "NASDAQ"},
     "TEAM": {"name": "Atlassian Corporation", "sector": "Technology", "market": "NASDAQ"},
     "SHOP": {"name": "Shopify Inc.", "sector": "Technology", "market": "NYSE"},
-    "SQ": {"name": "Block Inc.", "sector": "Fintech", "market": "NYSE"},
+    "XYZ": {"name": "Block Inc. (旧SQ)", "sector": "Fintech", "market": "NYSE"},
     "UBER": {"name": "Uber Technologies", "sector": "Technology", "market": "NYSE"},
     "ABNB": {"name": "Airbnb Inc.", "sector": "Technology", "market": "NASDAQ"},
     "DASH": {"name": "DoorDash Inc.", "sector": "Technology", "market": "NASDAQ"},
