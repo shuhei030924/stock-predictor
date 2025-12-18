@@ -1,13 +1,14 @@
 """
 バックグラウンド更新サービス
 ===========================
-ウォッチリストの株価データを自動更新
+ウォッチリストの株価データを自動更新（並列処理対応）
 """
 
 import threading
 import time
 from datetime import datetime, timedelta
 from typing import Callable, Optional, List, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 
 # ログ設定
@@ -16,18 +17,20 @@ logger = logging.getLogger(__name__)
 
 
 class BackgroundUpdater:
-    """バックグラウンドで株価データを更新するサービス"""
+    """バックグラウンドで株価データを更新するサービス（並列処理対応）"""
     
-    def __init__(self, db_manager, fetch_func: Callable, interval_minutes: int = 60):
+    def __init__(self, db_manager, fetch_func: Callable, interval_minutes: int = 60, max_workers: int = 10):
         """
         Args:
             db_manager: DatabaseManagerインスタンス
             fetch_func: 株価データを取得する関数 (ticker, period) -> DataFrame
             interval_minutes: 更新間隔（分）
+            max_workers: 並列ワーカー数（デフォルト10）
         """
         self.db = db_manager
         self.fetch_func = fetch_func
         self.interval = interval_minutes * 60  # 秒に変換
+        self.max_workers = max_workers
         
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
@@ -70,27 +73,40 @@ class BackgroundUpdater:
             self._stop_event.wait(timeout=self.interval)
     
     def _update_all_tickers(self):
-        """全ウォッチリスト銘柄を更新"""
+        """全ウォッチリスト銘柄を並列更新"""
         tickers = self.db.get_all_watchlist_tickers()
         
         if not tickers:
             logger.info("No tickers in watchlist")
             return
         
-        logger.info(f"Updating {len(tickers)} tickers...")
+        logger.info(f"Updating {len(tickers)} tickers with {self.max_workers} workers...")
         self._update_results = []
+        start_time = time.time()
         
-        for ticker in tickers:
-            result = self._update_single_ticker(ticker)
-            self._update_results.append(result)
+        # 並列処理で更新
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self._update_single_ticker, ticker): ticker for ticker in tickers}
             
-            # API制限を避けるため少し待機
-            time.sleep(0.5)
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    result = future.result()
+                    self._update_results.append(result)
+                except Exception as e:
+                    self._update_results.append({
+                        'ticker': ticker,
+                        'success': False,
+                        'records': 0,
+                        'error': str(e),
+                        'timestamp': datetime.now().isoformat()
+                    })
         
+        elapsed = time.time() - start_time
         self._last_update = datetime.now()
         
         success_count = sum(1 for r in self._update_results if r['success'])
-        logger.info(f"Update completed: {success_count}/{len(tickers)} successful")
+        logger.info(f"Update completed: {success_count}/{len(tickers)} successful in {elapsed:.1f}s")
     
     def _update_single_ticker(self, ticker: str) -> Dict:
         """単一銘柄を更新"""
@@ -126,21 +142,80 @@ class BackgroundUpdater:
         """単一銘柄を即座に更新（同期）"""
         return self._update_single_ticker(ticker)
     
+    def update_batch(self, tickers: List[str], max_workers: int = None) -> List[Dict]:
+        """指定した銘柄リストを並列更新（高速バッチ処理）
+        
+        Args:
+            tickers: 更新する銘柄リスト
+            max_workers: 並列数（Noneの場合はインスタンスのデフォルト値）
+        
+        Returns:
+            更新結果のリスト
+        """
+        if not tickers:
+            return []
+        
+        workers = max_workers or self.max_workers
+        logger.info(f"Batch updating {len(tickers)} tickers with {workers} workers...")
+        results = []
+        start_time = time.time()
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._update_single_ticker, ticker): ticker for ticker in tickers}
+            
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    results.append({
+                        'ticker': ticker,
+                        'success': False,
+                        'records': 0,
+                        'error': str(e),
+                        'timestamp': datetime.now().isoformat()
+                    })
+        
+        elapsed = time.time() - start_time
+        success_count = sum(1 for r in results if r['success'])
+        logger.info(f"Batch update: {success_count}/{len(tickers)} successful in {elapsed:.1f}s ({len(tickers)/elapsed:.1f} tickers/s)")
+        
+        return results
+    
     def update_stale(self, max_age_hours: int = 24) -> List[Dict]:
-        """古いキャッシュの銘柄のみ更新"""
+        """古いキャッシュの銘柄のみを並列更新"""
         stale_tickers = self.db.get_stale_tickers(max_age_hours)
         
         if not stale_tickers:
             logger.info("All caches are fresh")
             return []
         
-        logger.info(f"Updating {len(stale_tickers)} stale tickers...")
+        logger.info(f"Updating {len(stale_tickers)} stale tickers with {self.max_workers} workers...")
         results = []
+        start_time = time.time()
         
-        for ticker in stale_tickers:
-            result = self._update_single_ticker(ticker)
-            results.append(result)
-            time.sleep(0.5)
+        # 並列処理で更新
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {executor.submit(self._update_single_ticker, ticker): ticker for ticker in stale_tickers}
+            
+            for future in as_completed(futures):
+                ticker = futures[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    results.append({
+                        'ticker': ticker,
+                        'success': False,
+                        'records': 0,
+                        'error': str(e),
+                        'timestamp': datetime.now().isoformat()
+                    })
+        
+        elapsed = time.time() - start_time
+        success_count = sum(1 for r in results if r['success'])
+        logger.info(f"Stale update completed: {success_count}/{len(stale_tickers)} in {elapsed:.1f}s")
         
         return results
     
