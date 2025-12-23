@@ -49,6 +49,9 @@ Thumbs.db
 *.xlsx
 !sample_data/*.csv
 
+# Archive (old files)
+archive/
+
 # Database
 *.db
 data/
