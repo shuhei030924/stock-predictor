@@ -176,31 +176,46 @@ streamlit run app.py
 ## 🛠️ ファイル構成
 
 ```
-stock_predictor/
+stock-predictor/
 ├── app.py                    # メインWebアプリ
-├── stock_predictor.py        # コマンドライン版
 ├── run.bat                   # 実行スクリプト
 ├── setup.bat                 # セットアップスクリプト
 ├── requirements.txt          # 依存パッケージ
+├── README.md
 ├── models/
 │   ├── __init__.py
-│   └── lstm_model.py         # LSTM深層学習モデル
+│   ├── lstm_model.py         # LSTM深層学習モデル
+│   ├── xgb_model.py          # XGBoost (GPU対応)
+│   └── lgbm_model.py         # LightGBM
 ├── database/
 │   ├── __init__.py
 │   └── db_manager.py         # SQLiteデータベース管理
 ├── services/
 │   ├── __init__.py
-│   └── background_updater.py # バックグラウンド更新
+│   ├── background_updater.py # バックグラウンド更新
+│   ├── line_notify.py        # LINE通知
+│   ├── market_rules.py       # 市場ルール
+│   └── stock_predictor.py    # 株価予測エンジン
+├── scripts/                  # 実行スクリプト
+│   ├── add_tickers_to_watchlist.py
+│   ├── analyze_backtest.py
+│   ├── run_backtest_simple.py
+│   ├── run_backtest_v12.py
+│   └── run_signal_check.py
 ├── pages/
 │   ├── 01_accuracy.py        # 予測精度検証
 │   ├── 02_watchlist.py       # ウォッチリスト管理
 │   ├── 03_data_management.py # データ管理
 │   ├── 04_compare.py         # 銘柄比較
 │   ├── 05_portfolio.py       # ポートフォリオ
-│   └── 06_alerts.py          # 価格アラート
-├── data/
-│   └── stock_predictor.db    # SQLiteデータベース
-└── README.md
+│   ├── 06_alerts.py          # 価格アラート
+│   ├── 07_signal_heatmap.py  # シグナルヒートマップ
+│   ├── 08_historical_backtest.py  # バックテスト
+│   └── 09_realtime_signals.py     # リアルタイムシグナル
+├── analysis/                 # 分析結果保存
+├── docs/                     # ドキュメント
+└── data/
+    └── stock_predictor.db    # SQLiteデータベース
 ```
 
 ## 📚 使用技術
